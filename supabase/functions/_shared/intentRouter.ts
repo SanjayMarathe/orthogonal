@@ -203,8 +203,8 @@ function planFromLlmJson(
     topicQuery,
     catalogSearchPrompt,
     directApis,
-    skipCatalogSearch: skipDirect && intent === "web_search",
-    skipLlmToolRound: skipDirect && (intent === "web_search" || intent === "web_scrape"),
+    skipCatalogSearch,
+    skipLlmToolRound,
     confidence: (parsed.confidence as IntentPlan["confidence"]) ?? "medium",
     source: "llm",
   };
