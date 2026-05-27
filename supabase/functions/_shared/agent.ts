@@ -90,7 +90,6 @@ const TOOL_KEYWORDS = [
   "company",
   "contact",
   "data",
-  "tool",
   "endpoint",
   "crawl",
   "wiki",
@@ -101,11 +100,16 @@ const TOOL_KEYWORDS = [
   "funding",
 ];
 
+function explicitlySkipsTools(query: string): boolean {
+  return /\b(no tools?|don'?t use tools?|general message|just a general|casual talk|this is just)\b/i.test(query);
+}
+
 function requiresTooling(query: string, taggedApis: string[]): boolean {
   if (taggedApis.length > 0) return true;
+  if (explicitlySkipsTools(query)) return false;
   const lower = query.toLowerCase();
   if (lower.includes("@")) return true;
-  if (/\\b(what can you do|available apis|capabilities|tools?)\\b/.test(lower)) {
+  if (/\\b(what can you do|available apis|capabilities)\\b/.test(lower)) {
     return true;
   }
 
