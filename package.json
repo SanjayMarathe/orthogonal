@@ -1,0 +1,16 @@
+{
+  "name": "orthogonal-platform",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node scripts/test-all.mjs",
+    "test:unit": "node --experimental-strip-types --test tests/unit/*.test.ts tests/unit/*.test.mjs",
+    "test:integration": "node --test tests/integration/*.test.mjs",
+    "test:api-matrix": "node --test tests/integration/api-matrix.test.mjs",
+    "test:e2e": "node tests/e2e/chat-single.test.mjs",
+    "test:e2e:suite": "node tests/e2e/chat-suite.test.mjs",
+    "test:e2e:apis": "node tests/e2e/chat-api-matrix.test.mjs",
+    "test:build": "npm run build --prefix frontend",
+    "test:lint": "npm run lint --prefix frontend"
+  }
+}
