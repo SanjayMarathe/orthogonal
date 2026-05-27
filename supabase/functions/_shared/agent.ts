@@ -82,40 +82,6 @@ Slash commands: /clear, /compress.`;
 const EDGE_BUDGET_MS = 138_000;
 const MAX_TOOL_STEPS_BEFORE_SYNTH = 3;
 
-const TOOL_KEYWORDS = [
-  "api",
-  "search",
-  "scrape",
-  "enrich",
-  "company",
-  "contact",
-  "data",
-  "endpoint",
-  "crawl",
-  "wiki",
-  "web",
-  "news",
-  "leader",
-  "headcount",
-  "funding",
-];
-
-function explicitlySkipsTools(query: string): boolean {
-  return /\b(no tools?|don'?t use tools?|general message|just a general|casual talk|this is just)\b/i.test(query);
-}
-
-function requiresTooling(query: string, taggedApis: string[]): boolean {
-  if (taggedApis.length > 0) return true;
-  if (explicitlySkipsTools(query)) return false;
-  const lower = query.toLowerCase();
-  if (lower.includes("@")) return true;
-  if (/\\b(what can you do|available apis|capabilities)\\b/.test(lower)) {
-    return true;
-  }
-
-  return TOOL_KEYWORDS.some((kw) => lower.includes(kw));
-}
-
 export type ToolCache = {
   details: Map<string, string>;
   search: Map<string, string>;
@@ -793,35 +759,6 @@ export async function runAgentLoop(
   const routingTaggedApis =
     taggedApis.length > 0 ? taggedApis : inheritedTaggedApis;
 
-  const needsTooling = requiresTooling(effectiveUserQuery, routingTaggedApis);
-  if (!needsTooling) {
-    emitLive({ type: "reasoning_delta", placement: "agent", content: "Answering directly with the LLM (no tool discovery).\\n" });
-    emit({ type: "thinking", label: "Generating your answer…" });
-    const res = await llmChat(
-      model,
-      [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...messages,
-      ],
-      undefined,
-      { toolChoice: "none" },
-    );
-    const choice = (res.data.choices as Array<Record<string, unknown>>)?.[0];
-    const message = choice?.message as Record<string, unknown> | undefined;
-    const finalAnswer = ((message?.content as string) ?? "I couldn't generate a response.").trim();
-    if (finalAnswer) {
-      streamTokens(finalAnswer, emitLive);
-    }
-    return {
-      assistantContent: finalAnswer,
-      toolSteps: [],
-      reasoningLog: "",
-      usageTokens: undefined,
-      contentStreamed: Boolean(finalAnswer),
-      toolContext: priorToolContext ?? undefined,
-    };
-  }
-
   let reasoningLog = "";
 
   const emitLive: EmitFn = (event) => {
@@ -890,6 +827,50 @@ export async function runAgentLoop(
     ...messages,
   ];
 
+  let sessionLastEndpoint = apiSession?.lastEndpoint;
+  const sessionResult =
+    apiSession && !topicSwitch && routingTaggedApis.length > 0
+      ? await runSessionFollowUpPipeline(
+          apiSession,
+          effectiveUserQuery,
+          workingMessages,
+          toolSteps,
+          emitLive,
+          cache,
+          model,
+        )
+      : { ran: false };
+  sessionLastEndpoint = sessionResult.lastEndpoint ?? sessionLastEndpoint;
+  const sessionHandled = sessionResult.ran;
+
+  const fallbackIntentPlan: IntentPlan = {
+    intent: "api_discovery",
+    topicQuery: effectiveUserQuery,
+    catalogSearchPrompt: "",
+    directApis: [],
+    skipCatalogSearch: true,
+    skipLlmToolRound: true,
+    confidence: "high",
+    source: "rules",
+  };
+
+  const intentPlan = sessionHandled
+    ? fallbackIntentPlan
+    : await classifyQueryIntent(
+        model,
+        messages,
+        effectiveUserQuery,
+        taggedApis,
+        inheritedTaggedApis,
+      );
+
+  if (!sessionHandled) {
+    appendAgentReasoning(
+      emitLive,
+      `Routing as ${intentPlanSummary(intentPlan)}.\n`,
+    );
+  }
+
   let assistantContent = "";
   let usageTokens: number | undefined;
   const startedMs = Date.now();
@@ -908,56 +889,6 @@ export async function runAgentLoop(
   }
 
   appendAgentReasoning(emitLive, "Understanding what kind of data you need…\n");
-
-  let sessionLastEndpoint = apiSession?.lastEndpoint;
-
-  if (
-    apiSession &&
-    !topicSwitch &&
-    inheritedTaggedApis.length > 0 &&
-    apiSession.endpoints.length > 0
-  ) {
-    const sessionResult = await runSessionFollowUpPipeline(
-      apiSession,
-      effectiveUserQuery,
-      workingMessages,
-      toolSteps,
-      emitLive,
-      cache,
-      model,
-    );
-    if (sessionResult.lastEndpoint) {
-      sessionLastEndpoint = sessionResult.lastEndpoint;
-    }
-  }
-
-  const sessionHandled = hasSuccessfulApiRun(toolSteps);
-
-  const intentPlan = sessionHandled
-    ? {
-        intent: "api_discovery" as const,
-        topicQuery: effectiveUserQuery,
-        catalogSearchPrompt: "",
-        directApis: [],
-        skipCatalogSearch: true,
-        skipLlmToolRound: true,
-        confidence: "high" as const,
-        source: "rules" as const,
-      }
-    : await classifyQueryIntent(
-        model,
-        messages,
-        effectiveUserQuery,
-        taggedApis,
-        inheritedTaggedApis,
-      );
-
-  if (!sessionHandled) {
-    appendAgentReasoning(
-      emitLive,
-      `Routing as ${intentPlanSummary(intentPlan)}.\n`,
-    );
-  }
 
   if (followUpAffirmation && effectiveUserQuery !== userMessage.trim()) {
     appendAgentReasoning(
@@ -1069,22 +1000,25 @@ export async function runAgentLoop(
     contentStreamed = true;
   }
 
-  const toolContext = {
-    ...captureCatalogSearchContext(
-      intentPlan.topicQuery,
-      toolSteps,
-      workingMessages,
-    ),
-    intent: intentPlan.intent,
-    catalogSearchPrompt: intentPlan.catalogSearchPrompt,
-    activeSlug:
-      taggedApis[0]?.toLowerCase() ??
-      apiSession?.activeSlug ??
-      intentPlan.directApis[0]?.slug ??
-      priorToolContext?.activeSlug,
-    endpoints: apiSession?.endpoints ?? priorToolContext?.endpoints,
-    lastEndpoint: sessionLastEndpoint ?? priorToolContext?.lastEndpoint,
-  };
+  const hasToolContext = toolSteps.length > 0 || intentPlan.directApis.length > 0;
+  const toolContext = hasToolContext
+    ? {
+        ...captureCatalogSearchContext(
+          intentPlan.topicQuery,
+          toolSteps,
+          workingMessages,
+        ),
+        intent: intentPlan.intent,
+        catalogSearchPrompt: intentPlan.catalogSearchPrompt,
+        activeSlug:
+          taggedApis[0]?.toLowerCase() ??
+          apiSession?.activeSlug ??
+          intentPlan.directApis[0]?.slug ??
+          priorToolContext?.activeSlug,
+        endpoints: apiSession?.endpoints ?? priorToolContext?.endpoints,
+        lastEndpoint: sessionLastEndpoint ?? priorToolContext?.lastEndpoint,
+      }
+    : undefined;
 
   return {
     assistantContent,

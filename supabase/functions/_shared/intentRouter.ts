@@ -25,10 +25,6 @@ export type IntentPlan = {
   source: "rules" | "llm" | "rules+llm";
 };
 
-const WEB_SEARCH_SLUGS = ["perplexity", "parallel"] as const;
-const COMPANY_SLUGS = ["company-enrich", "crustdata"] as const;
-const SCRAPE_SLUGS = ["scrapegraphai", "olostep"] as const;
-
 const NON_COMPANY_TAGS = new Set([
   "perplexity",
   "parallel",
@@ -77,7 +73,7 @@ export function buildCatalogSearchPrompt(
   }
 }
 
-function planFromTaggedApis(
+export function planFromTaggedApis(
   topicQuery: string,
   taggedApis: string[],
 ): IntentPlan | null {
@@ -123,111 +119,6 @@ function planFromTaggedApis(
     confidence: "high",
     source: "rules",
   };
-}
-
-/** Rule-based intent classification — fast path for clear patterns. */
-export function classifyIntentRules(
-  topicQuery: string,
-  taggedApis: string[],
-  inheritedTaggedApis: string[] = [],
-): IntentPlan | null {
-  const sessionTags =
-    taggedApis.length > 0 ? taggedApis : inheritedTaggedApis;
-  const tagged = planFromTaggedApis(topicQuery, sessionTags);
-  if (tagged) return tagged;
-
-  const t = topicQuery.toLowerCase();
-
-  if (
-    /\b(popular\s+creator|creators|tiktok|youtube playlist|subreddit|kick clip)\b/.test(
-      t,
-    ) &&
-    !/\b(scrape|homepage|html|fetch url|website content)\b/.test(t)
-  ) {
-    const hasSpec = hasTaggedRunSpec("scrapecreators", topicQuery);
-    return {
-      intent: "api_discovery",
-      topicQuery,
-      catalogSearchPrompt:
-        "social media creators tiktok youtube API scrapecreators",
-      directApis: [{ slug: "scrapecreators", reason: "social/creator query" }],
-      skipCatalogSearch: true,
-      skipLlmToolRound: hasSpec,
-      confidence: "high",
-      source: "rules",
-    };
-  }
-
-  if (isNewsOrWebIntent(topicQuery)) {
-    return {
-      intent: "web_search",
-      topicQuery,
-      catalogSearchPrompt: buildCatalogSearchPrompt("web_search", topicQuery),
-      directApis: [{ slug: "perplexity", reason: "news or current-events query" }],
-      skipCatalogSearch: true,
-      skipLlmToolRound: true,
-      confidence: "high",
-      source: "rules",
-    };
-  }
-
-  if (isCompanyResearchIntent(topicQuery, [])) {
-    return {
-      intent: "company_research",
-      topicQuery,
-      catalogSearchPrompt: buildCatalogSearchPrompt("company_research", topicQuery),
-      directApis: [],
-      skipCatalogSearch: false,
-      skipLlmToolRound: false,
-      confidence: "high",
-      source: "rules",
-    };
-  }
-
-  if (/\b(scrape|website|page content|crawl|extract html|fetch url)\b/.test(t)) {
-    return {
-      intent: "web_scrape",
-      topicQuery,
-      catalogSearchPrompt: buildCatalogSearchPrompt("web_scrape", topicQuery),
-      directApis: [{ slug: "scrapegraphai", reason: "web scraping query" }],
-      skipCatalogSearch: true,
-      skipLlmToolRound: true,
-      confidence: "medium",
-      source: "rules",
-    };
-  }
-
-  if (
-    /\b(email|contact|decision.?maker|vp\b|c-?suite|find people|phone number)\b/.test(
-      t,
-    )
-  ) {
-    return {
-      intent: "people_search",
-      topicQuery,
-      catalogSearchPrompt: buildCatalogSearchPrompt("people_search", topicQuery),
-      directApis: [{ slug: "crustdata", reason: "people/contacts query" }],
-      skipCatalogSearch: false,
-      skipLlmToolRound: false,
-      confidence: "medium",
-      source: "rules",
-    };
-  }
-
-  if (/\b(what can you do|which api|available apis|capabilities)\b/.test(t)) {
-    return {
-      intent: "capability",
-      topicQuery,
-      catalogSearchPrompt: buildCatalogSearchPrompt("capability", topicQuery),
-      directApis: [],
-      skipCatalogSearch: true,
-      skipLlmToolRound: true,
-      confidence: "high",
-      source: "rules",
-    };
-  }
-
-  return null;
 }
 
 const INTENT_CLASSIFIER_SYSTEM = `You classify user queries for an API routing layer. Output ONLY valid JSON (no markdown fences).
@@ -303,18 +194,6 @@ function planFromLlmJson(
 }
 
 /** Merge rule plan with LLM when rules are low-confidence or missing. */
-export function mergeIntentPlans(
-  rules: IntentPlan | null,
-  llm: IntentPlan,
-): IntentPlan {
-  if (!rules) return llm;
-  if (rules.confidence === "high") return rules;
-  if (llm.confidence === "high" && rules.confidence !== "high") {
-    return { ...llm, source: "rules+llm" };
-  }
-  return rules;
-}
-
 /**
  * Classify intent before any tool calls.
  * Rules handle clear cases; LLM resolves ambiguous queries.
@@ -326,12 +205,10 @@ export async function classifyQueryIntent(
   taggedApis: string[],
   inheritedTaggedApis: string[] = [],
 ): Promise<IntentPlan> {
-  const rules = classifyIntentRules(
-    topicQuery,
-    taggedApis,
-    inheritedTaggedApis,
-  );
-  if (rules?.confidence === "high") return rules;
+  const sessionTags =
+    taggedApis.length > 0 ? taggedApis : inheritedTaggedApis;
+  const taggedPlan = planFromTaggedApis(topicQuery, sessionTags);
+  if (taggedPlan) return taggedPlan;
 
   const recent = messages
     .filter((m) => m.role === "user" || m.role === "assistant")
@@ -357,28 +234,36 @@ export async function classifyQueryIntent(
   );
 
   if (!res.ok) {
-    return (
-      rules ?? {
-        intent: "api_discovery",
-        topicQuery,
-        catalogSearchPrompt: buildCatalogSearchPrompt("api_discovery", topicQuery),
-        directApis: [],
-        skipCatalogSearch: false,
-        skipLlmToolRound: false,
-        confidence: "low",
-        source: "rules",
-      }
-    );
+    return {
+      intent: "api_discovery",
+      topicQuery,
+      catalogSearchPrompt: buildCatalogSearchPrompt("api_discovery", topicQuery),
+      directApis: [],
+      skipCatalogSearch: false,
+      skipLlmToolRound: false,
+      confidence: "low",
+      source: "rules",
+    };
   }
 
   const choice = (res.data.choices as Array<Record<string, unknown>>)?.[0];
   const message = choice?.message as Record<string, unknown> | undefined;
   const content = (message?.content as string) ?? "";
   const parsed = parseClassifierJson(content);
-  if (!parsed) return rules ?? planFromLlmJson({ intent: "api_discovery" }, topicQuery);
+  if (!parsed) {
+    return {
+      intent: "api_discovery",
+      topicQuery,
+      catalogSearchPrompt: buildCatalogSearchPrompt("api_discovery", topicQuery),
+      directApis: [],
+      skipCatalogSearch: false,
+      skipLlmToolRound: false,
+      confidence: "low",
+      source: "rules",
+    };
+  }
 
-  const llmPlan = planFromLlmJson(parsed, topicQuery);
-  return mergeIntentPlans(rules, llmPlan);
+  return planFromLlmJson(parsed, topicQuery);
 }
 
 export function intentPlanSummary(plan: IntentPlan): string {
@@ -386,4 +271,3 @@ export function intentPlanSummary(plan: IntentPlan): string {
   return `${plan.intent} → ${apis}`;
 }
 
-export { WEB_SEARCH_SLUGS, COMPANY_SLUGS, SCRAPE_SLUGS };

@@ -2,8 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   buildCatalogSearchPrompt,
-  classifyIntentRules,
   intentPlanSummary,
+  planFromTaggedApis,
 } from "../../supabase/functions/_shared/intentRouter.ts";
 import {
   isFollowUpAffirmation,
@@ -11,16 +11,19 @@ import {
 } from "../../supabase/functions/_shared/conversationContext.ts";
 import type { ChatMessage } from "../../supabase/functions/_shared/types.ts";
 
-test("classifyIntentRules routes OpenAI enterprise news to perplexity", () => {
-  const plan = classifyIntentRules(
-    "What is the latest news on OpenAI's enterprise product line?",
-    [],
-  );
+test("planFromTaggedApis routes @perplexity to Perplexity", () => {
+  const plan = planFromTaggedApis("Stripe product launches", ["perplexity"]);
   assert.ok(plan);
-  assert.equal(plan!.intent, "web_search");
-  assert.equal(plan!.directApis[0]?.slug, "perplexity");
-  assert.equal(plan!.skipLlmToolRound, true);
-  assert.doesNotMatch(plan!.catalogSearchPrompt, /openai/i);
+  assert.equal(plan?.intent, "web_search");
+  assert.equal(plan?.directApis[0]?.slug, "perplexity");
+  assert.equal(plan?.skipCatalogSearch, true);
+});
+
+test("planFromTaggedApis routes @scrapecreators to Scrape Creators", () => {
+  const plan = planFromTaggedApis("popular creators", ["scrapecreators"]);
+  assert.ok(plan);
+  assert.equal(plan?.directApis[0]?.slug, "scrapecreators");
+  assert.equal(plan?.skipCatalogSearch, true);
 });
 
 test("buildCatalogSearchPrompt avoids entity names for web search", () => {
@@ -32,41 +35,8 @@ test("buildCatalogSearchPrompt avoids entity names for web search", () => {
   assert.doesNotMatch(prompt, /openai/i);
 });
 
-test("classifyIntentRules routes Shopify ICP to company_research", () => {
-  const plan = classifyIntentRules(
-    "Is Shopify a good ICP? Use headcount and leadership data.",
-    [],
-  );
-  assert.ok(plan);
-  assert.equal(plan!.intent, "company_research");
-});
-
-test("classifyIntentRules honors @perplexity tag", () => {
-  const plan = classifyIntentRules("@perplexity Stripe launches this quarter", [
-    "perplexity",
-  ]);
-  assert.ok(plan);
-  assert.equal(plan!.directApis[0]?.slug, "perplexity");
-  assert.equal(plan!.skipCatalogSearch, true);
-});
-
-test("classifyIntentRules routes popular creators to scrapecreators", () => {
-  const plan = classifyIntentRules("what are the popular creators?", [], [
-    "scrapecreators",
-  ]);
-  assert.ok(plan);
-  assert.equal(plan!.directApis[0]?.slug, "scrapecreators");
-  assert.notEqual(plan!.directApis[0]?.slug, "scrapegraphai");
-});
-
-test("classifyIntentRules routes popular creators without tag to scrapecreators", () => {
-  const plan = classifyIntentRules("what are the popular creators?", []);
-  assert.ok(plan);
-  assert.equal(plan!.directApis[0]?.slug, "scrapecreators");
-});
-
 test("intentPlanSummary is readable", () => {
-  const plan = classifyIntentRules("latest news on Stripe", []);
+  const plan = planFromTaggedApis("Stripe news", ["perplexity"]);
   assert.match(intentPlanSummary(plan!), /web_search.*perplexity/);
 });
 
