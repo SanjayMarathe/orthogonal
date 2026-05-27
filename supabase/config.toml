@@ -21,3 +21,6 @@ enable_anonymous_sign_ins = true
 
 [functions.chat]
 verify_jwt = true
+
+[functions.auth]
+verify_jwt = false
