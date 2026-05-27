@@ -8,6 +8,7 @@ import {
 import { useState } from "react";
 import { cn } from "@/lib/utils";
 import type { ToolStep } from "@/lib/supabase";
+import { StepReasoningText } from "./StepReasoningText";
 
 function ToolIcon({ tool }: { tool: string }) {
   const className = "h-4 w-4 shrink-0 text-gray-500 dark:text-gray-400";
@@ -34,6 +35,11 @@ export function ToolStepPill({ step }: ToolStepPillProps) {
 
   return (
     <div className="mb-2">
+      {step.reasoning?.trim() && (
+        <div className="mb-1.5 ml-1 border-l-2 border-gray-200 pl-3 dark:border-gray-700">
+          <StepReasoningText content={step.reasoning} />
+        </div>
+      )}
       <button
         type="button"
         onClick={() => setExpanded(!expanded)}

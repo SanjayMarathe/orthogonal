@@ -10,7 +10,7 @@ import {
 } from "./crustdataHelpers.ts";
 import { companyNameFromDomain } from "./crustdataHelpers.ts";
 import { formatLeadershipFallback, extractCompanyDomain } from "./leadership.ts";
-import { llmChat, llmChatStreamWithTools } from "./llm.ts";
+import { llmChat, llmChatStream, llmChatStreamWithTools } from "./llm.ts";
 import {
   formatToolResultsFallback,
   synthesizeFromToolResults,
@@ -42,6 +42,7 @@ import {
 } from "./apiSession.ts";
 import {
   classifyQueryIntent,
+  intentPlanNeedsTools,
   intentPlanSummary,
   type IntentPlan,
 } from "./intentRouter.ts";
@@ -77,6 +78,8 @@ Before every tool call, write 1–3 sentences in plain natural language explaini
 Only mention email/SMS sending if the user explicitly asked to send a message.
 
 Slash commands: /clear, /compress.`;
+
+const CHAT_SYSTEM_PROMPT = `You are a helpful assistant. Answer clearly and concisely. This app can call external data APIs when the user asks for live data; for normal chat, just reply. Slash commands: /clear, /compress.`;
 
 /** Supabase edge wall clock ~150s — stop calling tools early so synthesis always runs. */
 const EDGE_BUDGET_MS = 138_000;
@@ -117,6 +120,35 @@ function rejectApi(api: string, cache?: ToolCache): string {
 
 export type EmitFn = (event: SseEvent) => void;
 
+async function answerDirectly(
+  model: string,
+  messages: ChatMessage[],
+  emit: EmitFn,
+): Promise<{ assistantContent: string; contentStreamed: boolean }> {
+  emit({ type: "thinking", label: "Generating your answer…" });
+  let assistantContent = "";
+  const streamRes = await llmChatStream(
+    model,
+    [{ role: "system", content: CHAT_SYSTEM_PROMPT }, ...messages],
+    (token) => {
+      assistantContent += token;
+      emit({ type: "token", content: token });
+    },
+    { toolChoice: "none", maxTokens: 2048 },
+  );
+  const content = (streamRes.content || assistantContent).trim();
+  if (!content) {
+    return {
+      assistantContent: "I couldn't generate a response.",
+      contentStreamed: false,
+    };
+  }
+  if (!streamRes.ok && !assistantContent) {
+    streamTokens(content, emit);
+  }
+  return { assistantContent: content, contentStreamed: Boolean(assistantContent) };
+}
+
 function coerceToolArgs(
   name: string,
   args: Record<string, unknown>,
@@ -129,8 +161,9 @@ function appendAgentReasoning(emit: EmitFn, text: string) {
   emit({ type: "reasoning_delta", placement: "agent", content: text });
 }
 
-function appendStepReasoning(emit: EmitFn, _stepId: string, text: string) {
-  appendAgentReasoning(emit, text);
+function appendStepReasoning(emit: EmitFn, stepId: string, text: string) {
+  if (!text) return;
+  emit({ type: "reasoning_delta", stepId, content: text });
 }
 
 function appendAfterToolsReasoning(emit: EmitFn, text: string) {
@@ -767,33 +800,21 @@ export async function runAgentLoop(
     inheritedTaggedApis,
   );
 
-  const planNeedsTools =
-    intentPlan.directApis.length > 0 || !intentPlan.skipCatalogSearch;
+  const planNeedsTools = intentPlanNeedsTools(intentPlan);
 
   if (!planNeedsTools) {
-    emit({ type: "thinking", label: "Generating your answer…" });
-    const res = await llmChat(
+    const { assistantContent, contentStreamed } = await answerDirectly(
       model,
-      [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...messages,
-      ],
-      undefined,
-      { toolChoice: "none" },
+      messages,
+      emit,
     );
-    const choice = (res.data.choices as Array<Record<string, unknown>>)?.[0];
-    const message = choice?.message as Record<string, unknown> | undefined;
-    const finalAnswer = ((message?.content as string) ?? "I couldn't generate a response.").trim();
-    if (finalAnswer) {
-      streamTokens(finalAnswer, emit);
-    }
     return {
-      assistantContent: finalAnswer,
+      assistantContent,
       toolSteps: [],
       reasoningLog: "",
       usageTokens: undefined,
-      contentStreamed: Boolean(finalAnswer),
-      toolContext: priorToolContext ?? undefined,
+      contentStreamed,
+      toolContext: undefined,
     };
   }
 
@@ -870,45 +891,6 @@ export async function runAgentLoop(
     ...messages,
   ];
 
-  let sessionLastEndpoint = apiSession?.lastEndpoint;
-  const sessionResult =
-    planNeedsTools && apiSession && !topicSwitch && routingTaggedApis.length > 0
-      ? await runSessionFollowUpPipeline(
-          apiSession,
-          effectiveUserQuery,
-          workingMessages,
-          toolSteps,
-          emitLive,
-          cache,
-          model,
-        )
-      : { ran: false };
-  sessionLastEndpoint = sessionResult.lastEndpoint ?? sessionLastEndpoint;
-  const sessionHandled = sessionResult.ran;
-
-  if (planNeedsTools) {
-    appendAgentReasoning(emitLive, "Understanding what kind of data you need…\n");
-
-    if (followUpAffirmation && effectiveUserQuery !== userMessage.trim()) {
-      appendAgentReasoning(
-        emitLive,
-        `Continuing from your earlier question: ${effectiveUserQuery.slice(0, 140)}${effectiveUserQuery.length > 140 ? "…" : ""}\n`,
-      );
-    }
-
-    if (!sessionHandled) {
-      await executeIntentPlan(
-        intentPlan,
-        workingMessages,
-        toolSteps,
-        emitLive,
-        cache,
-        priorToolContext,
-        followUpAffirmation,
-      );
-    }
-  }
-
   let assistantContent = "";
   let usageTokens: number | undefined;
   const startedMs = Date.now();
@@ -926,27 +908,41 @@ export async function runAgentLoop(
     cache.allowedSlugs.add(tag.toLowerCase());
   }
 
-  if (planNeedsTools) {
-    appendAgentReasoning(emitLive, "Understanding what kind of data you need…\n");
+  let sessionLastEndpoint = apiSession?.lastEndpoint;
+  const sessionResult =
+    apiSession && !topicSwitch && routingTaggedApis.length > 0
+      ? await runSessionFollowUpPipeline(
+          apiSession,
+          effectiveUserQuery,
+          workingMessages,
+          toolSteps,
+          emitLive,
+          cache,
+          model,
+        )
+      : { ran: false };
+  sessionLastEndpoint = sessionResult.lastEndpoint ?? sessionLastEndpoint;
+  const sessionHandled = sessionResult.ran;
 
-    if (followUpAffirmation && effectiveUserQuery !== userMessage.trim()) {
-      appendAgentReasoning(
-        emitLive,
-        `Continuing from your earlier question: ${effectiveUserQuery.slice(0, 140)}${effectiveUserQuery.length > 140 ? "…" : ""}\n`,
-      );
-    }
+  appendAgentReasoning(emitLive, "Understanding what kind of data you need…\n");
 
-    if (!sessionHandled) {
-      await executeIntentPlan(
-        intentPlan,
-        workingMessages,
-        toolSteps,
-        emitLive,
-        cache,
-        priorToolContext,
-        followUpAffirmation,
-      );
-    }
+  if (followUpAffirmation && effectiveUserQuery !== userMessage.trim()) {
+    appendAgentReasoning(
+      emitLive,
+      `Continuing from your earlier question: ${effectiveUserQuery.slice(0, 140)}${effectiveUserQuery.length > 140 ? "…" : ""}\n`,
+    );
+  }
+
+  if (!sessionHandled) {
+    await executeIntentPlan(
+      intentPlan,
+      workingMessages,
+      toolSteps,
+      emitLive,
+      cache,
+      priorToolContext,
+      followUpAffirmation,
+    );
   }
 
   const companyResearch = intentPlan.intent === "company_research";
@@ -999,7 +995,7 @@ export async function runAgentLoop(
     taggedApis,
   );
 
-  appendAgentReasoning(
+  appendAfterToolsReasoning(
     emitLive,
     "Writing up your answer from the API results.\n",
   );

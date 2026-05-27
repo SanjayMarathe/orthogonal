@@ -129,7 +129,8 @@ export function useChat(onConversationUpdate?: () => void) {
         setMessages((prev) => [...prev, userMsg]);
 
         const liveToolSteps: ToolStep[] = [];
-        let agentReasoning = "";
+        let pendingStepReasoning = "";
+        let afterToolsReasoning = "";
 
         setMessages((prev) => [
           ...prev,
@@ -215,26 +216,11 @@ export function useChat(onConversationUpdate?: () => void) {
               );
             }
             if (event.type === "reasoning" && event.content) {
-              agentReasoning += event.content + "\n";
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantId
-                    ? {
-                        ...m,
-                        agentReasoning,
-                        isThinking: false,
-                      }
-                    : m,
-                ),
-              );
-            }
-            if (event.type === "reasoning_delta" && event.content) {
-              if (
-                event.placement === "agent" ||
-                event.placement === "after_tools" ||
-                !event.stepId
-              ) {
-                agentReasoning += event.content;
+              const chunk = event.content + "\n";
+              if (liveToolSteps.length > 0) {
+                afterToolsReasoning += chunk;
+              } else {
+                pendingStepReasoning += chunk;
               }
               setMessages((prev) =>
                 prev.map((m) =>
@@ -242,7 +228,37 @@ export function useChat(onConversationUpdate?: () => void) {
                     ? {
                         ...m,
                         toolSteps: [...liveToolSteps],
-                        agentReasoning,
+                        agentReasoning: afterToolsReasoning,
+                        isThinking: false,
+                      }
+                    : m,
+                ),
+              );
+            }
+            if (event.type === "reasoning_delta" && event.content) {
+              if (event.placement === "after_tools") {
+                afterToolsReasoning += event.content;
+              } else if (event.stepId) {
+                const idx = liveToolSteps.findIndex((s) => s.id === event.stepId);
+                if (idx >= 0) {
+                  const step = liveToolSteps[idx];
+                  liveToolSteps[idx] = {
+                    ...step,
+                    reasoning: (step.reasoning ?? "") + event.content,
+                  };
+                } else {
+                  pendingStepReasoning += event.content;
+                }
+              } else {
+                pendingStepReasoning += event.content;
+              }
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId
+                    ? {
+                        ...m,
+                        toolSteps: [...liveToolSteps],
+                        agentReasoning: afterToolsReasoning,
                         isThinking: false,
                       }
                     : m,
@@ -250,12 +266,16 @@ export function useChat(onConversationUpdate?: () => void) {
               );
             }
             if (event.type === "tool_start" && event.id) {
+              const stepReasoning =
+                pendingStepReasoning.trim() || event.reasoningBefore?.trim() || "";
+              pendingStepReasoning = "";
               liveToolSteps.push({
                 id: event.id,
                 tool: event.tool ?? "",
                 label: event.label ?? "Running…",
                 status: "running",
                 args: event.args,
+                reasoning: stepReasoning || undefined,
               });
               setMessages((prev) =>
                 prev.map((m) =>
@@ -263,6 +283,7 @@ export function useChat(onConversationUpdate?: () => void) {
                     ? {
                         ...m,
                         toolSteps: [...liveToolSteps],
+                        agentReasoning: afterToolsReasoning,
                         isThinking: false,
                       }
                     : m,
@@ -272,12 +293,17 @@ export function useChat(onConversationUpdate?: () => void) {
             if (event.type === "tool_done" && event.id) {
               const idx = liveToolSteps.findIndex((s) => s.id === event.id);
               if (idx >= 0) {
+                const step = liveToolSteps[idx];
+                const extra = event.reasoningAfter?.trim();
                 liveToolSteps[idx] = {
-                  ...liveToolSteps[idx],
-                  label: event.label ?? liveToolSteps[idx].label,
+                  ...step,
+                  label: event.label ?? step.label,
                   status: event.success ? "done" : "error",
                   resultPreview: event.resultPreview,
                   meta: event.meta,
+                  reasoning: extra
+                    ? [step.reasoning, extra].filter(Boolean).join("\n")
+                    : step.reasoning,
                 };
               }
               setMessages((prev) =>
@@ -286,7 +312,7 @@ export function useChat(onConversationUpdate?: () => void) {
                     ? {
                         ...m,
                         toolSteps: [...liveToolSteps],
-                        agentReasoning,
+                        agentReasoning: afterToolsReasoning,
                         isThinking: false,
                       }
                     : m,
@@ -302,7 +328,7 @@ export function useChat(onConversationUpdate?: () => void) {
                         ...m,
                         content,
                         toolSteps: [...liveToolSteps],
-                        agentReasoning,
+                        agentReasoning: afterToolsReasoning,
                         isThinking: false,
                       }
                     : m,
@@ -333,6 +359,17 @@ export function useChat(onConversationUpdate?: () => void) {
           }
         }
 
+        if (pendingStepReasoning.trim() && liveToolSteps.length > 0) {
+          const last = liveToolSteps[liveToolSteps.length - 1];
+          liveToolSteps[liveToolSteps.length - 1] = {
+            ...last,
+            reasoning: [last.reasoning, pendingStepReasoning.trim()]
+              .filter(Boolean)
+              .join("\n"),
+          };
+          pendingStepReasoning = "";
+        }
+
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
@@ -340,7 +377,7 @@ export function useChat(onConversationUpdate?: () => void) {
                   ...m,
                   content,
                   toolSteps: [...liveToolSteps],
-                  agentReasoning,
+                  agentReasoning: afterToolsReasoning,
                   isStreaming: false,
                   isThinking: false,
                 }

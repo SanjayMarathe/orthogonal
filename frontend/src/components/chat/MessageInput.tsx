@@ -182,7 +182,7 @@ export function MessageInput({
           selectedIndex={mentionIndex}
           onSelect={(integration) => insertMention(integration.slug)}
         />
-        <div className="rounded-2xl border border-gray-200 bg-white px-4 py-3 shadow-sm dark:border-gray-700 dark:bg-gray-900">
+        <div className="rounded-2xl border border-gray-200 bg-white px-4 py-3 shadow-sm dark:border-gray-700 dark:bg-gray-800 dark:shadow-none">
           {pendingFiles.length > 0 && (
             <div className="mb-2 flex flex-wrap gap-1.5">
               {pendingFiles.map((file, i) => (

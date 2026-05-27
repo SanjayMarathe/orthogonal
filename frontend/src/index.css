@@ -6,6 +6,25 @@
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
 }
 
+/*
+ * ChatGPT-like neutral dark palette (scoped to .dark so light mode stays default).
+ * Lower steps = surfaces; upper steps = text and subtle borders.
+ */
+.dark {
+  color-scheme: dark;
+  --color-gray-950: #171717;
+  --color-gray-900: #212121;
+  --color-gray-800: #303030;
+  --color-gray-700: #424242;
+  --color-gray-600: #525252;
+  --color-gray-500: #8e8e8e;
+  --color-gray-400: #acacac;
+  --color-gray-300: #cdcdcd;
+  --color-gray-200: #e5e5e5;
+  --color-gray-100: #ececec;
+  --color-gray-50: #f7f7f7;
+}
+
 html,
 body,
 #root {
@@ -21,8 +40,8 @@ body {
 }
 
 .dark body {
-  background: #030712;
-  color: #f3f4f6;
+  background: #212121;
+  color: #ececec;
 }
 
 @keyframes pulse-border {
@@ -42,10 +61,10 @@ body {
 @keyframes pulse-border-dark {
   0%,
   100% {
-    border-color: #374151;
+    border-color: #424242;
   }
   50% {
-    border-color: #6b7280;
+    border-color: #6e6e6e;
   }
 }
 

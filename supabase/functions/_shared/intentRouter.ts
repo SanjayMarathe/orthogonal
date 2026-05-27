@@ -49,6 +49,13 @@ const COMPANY_TAGS = new Set([
 const CATALOG_AMBIGUOUS_ENTITIES =
   /\b(openai|anthropic|stripe|shopify|google|microsoft|meta|amazon|twilio|sendgrid|notion|slack)\b/i;
 
+/** Fast Groq model for intent-only calls (no tools). */
+export const INTENT_CLASSIFIER_MODEL = "groq:llama-3.1-8b-instant";
+
+export function intentPlanNeedsTools(plan: IntentPlan): boolean {
+  return plan.directApis.length > 0 || !plan.skipCatalogSearch;
+}
+
 /**
  * Build a capability-focused catalog search prompt.
  * Never pass "OpenAI enterprise news" — semantic search returns the OpenAI API slug.
@@ -121,32 +128,23 @@ export function planFromTaggedApis(
   };
 }
 
-const INTENT_CLASSIFIER_SYSTEM = `You classify user queries for an API routing layer. Output ONLY valid JSON (no markdown fences).
+const INTENT_CLASSIFIER_SYSTEM = `You decide whether the user's message needs Orthogonal API tools. Output ONLY valid JSON (no markdown).
 
-Intents:
-- web_search: news, latest updates, product launches, current events, "what happened", cite sources
-- company_research: headcount, ICP, workforce, leadership, funding, company profile, enrichment
-- web_scrape: scrape website, extract page content, crawl URLs
-- people_search: find contacts, emails, decision makers, executives
-- api_discovery: find which API to use, general data lookup
-- capability: what APIs are available, what can you do
+Default: general chat does NOT need tools — set skipCatalogSearch and skipLlmToolRound to true.
 
-CRITICAL: A company name in the question (OpenAI, Stripe, Shopify) does NOT mean use that company's API slug.
-Example: "latest news on OpenAI enterprise" → web_search with primaryApi "perplexity", NOT "openai".
-If Active API from prior turn is set (e.g. scrapecreators), continue with that slug for follow-ups like "popular creators".
-"popular creators" / TikTok / YouTube → primaryApi "scrapecreators", NOT "scrapegraphai".
-If the query is casual (e.g. "test message") or general conversation, set skipCatalogSearch and skipLlmToolRound to true so the agent answers directly without tooling.
-If the query clearly wants data, set skipCatalogSearch to false and provide a catalogSearchPrompt that guides tooling.
+Set skipCatalogSearch and skipLlmToolRound to false ONLY when the user clearly wants live external data: company enrichment, news/current events, web scrape, contacts/decision makers, or which API to use for a data task.
 
-JSON schema:
+Company names in the question (OpenAI, Stripe) are topics — NOT API slugs. News about OpenAI → intent web_search, primaryApi perplexity, skipCatalogSearch false.
+If Active API from prior turn is set, keep that slug for follow-ups on the same API.
+
+JSON:
 {
   "intent": "web_search|company_research|web_scrape|people_search|api_discovery|capability",
-  "topicQuery": "cleaned user information need",
-  "catalogSearchPrompt": "capability keywords for API catalog (never just a brand name)",
-  "primaryApi": "perplexity|company-enrich|crustdata|parallel|scrapegraphai|null",
-  "skipCatalogSearch": true|false,
-  "skipLlmToolRound": true|false,
-  "confidence": "high|medium|low"
+  "topicQuery": "string",
+  "catalogSearchPrompt": "capability keywords for catalog search, never bare brand name",
+  "primaryApi": "perplexity|company-enrich|crustdata|parallel|scrapegraphai|scrapecreators|null",
+  "skipCatalogSearch": true,
+  "skipLlmToolRound": true
 }`;
 
 function parseClassifierJson(raw: string): Record<string, unknown> | null {
@@ -184,7 +182,6 @@ function planFromLlmJson(
     directApis.push({ slug: "perplexity", reason: "web_search default" });
   }
 
-  const skipDirect = directApis.length > 0;
   const explicitSkipCatalogSearch =
     typeof parsed.skipCatalogSearch === "boolean"
       ? parsed.skipCatalogSearch
@@ -193,11 +190,8 @@ function planFromLlmJson(
     typeof parsed.skipLlmToolRound === "boolean"
       ? parsed.skipLlmToolRound
       : undefined;
-  const skipCatalogSearch =
-    explicitSkipCatalogSearch ?? (skipDirect && intent === "web_search");
-  const skipLlmToolRound =
-    explicitSkipLlmToolRound ??
-    (skipDirect && (intent === "web_search" || intent === "web_scrape"));
+  const skipCatalogSearch = explicitSkipCatalogSearch ?? true;
+  const skipLlmToolRound = explicitSkipLlmToolRound ?? skipCatalogSearch;
   return {
     intent,
     topicQuery,
@@ -234,7 +228,7 @@ export async function classifyQueryIntent(
     .join("\n");
 
   const res = await llmChat(
-    model,
+    INTENT_CLASSIFIER_MODEL,
     [
       { role: "system", content: INTENT_CLASSIFIER_SYSTEM },
       {
@@ -247,7 +241,7 @@ export async function classifyQueryIntent(
       },
     ],
     undefined,
-    { toolChoice: "none", maxTokens: 300 },
+    { toolChoice: "none", maxTokens: 200 },
   );
 
   if (!res.ok) {
@@ -256,8 +250,8 @@ export async function classifyQueryIntent(
       topicQuery,
       catalogSearchPrompt: buildCatalogSearchPrompt("api_discovery", topicQuery),
       directApis: [],
-      skipCatalogSearch: false,
-      skipLlmToolRound: false,
+      skipCatalogSearch: true,
+      skipLlmToolRound: true,
       confidence: "low",
       source: "rules",
     };
@@ -273,8 +267,8 @@ export async function classifyQueryIntent(
       topicQuery,
       catalogSearchPrompt: buildCatalogSearchPrompt("api_discovery", topicQuery),
       directApis: [],
-      skipCatalogSearch: false,
-      skipLlmToolRound: false,
+      skipCatalogSearch: true,
+      skipLlmToolRound: true,
       confidence: "low",
       source: "rules",
     };

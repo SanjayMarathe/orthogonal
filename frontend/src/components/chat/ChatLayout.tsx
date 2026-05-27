@@ -90,7 +90,7 @@ function ChatLayoutInner() {
 
   if (!authReady) {
     return (
-      <div className="relative flex h-full items-center justify-center bg-white dark:bg-gray-950">
+      <div className="relative flex h-full items-center justify-center bg-white dark:bg-gray-900">
         <div className="absolute right-4 top-4">
           <ThemeToggle />
         </div>
@@ -100,7 +100,7 @@ function ChatLayoutInner() {
   }
 
   return (
-    <div className="flex h-full bg-white dark:bg-gray-950">
+    <div className="flex h-full bg-white dark:bg-gray-900">
       <ConversationSidebar
         conversations={conversations}
         currentConversationId={conversationId}
