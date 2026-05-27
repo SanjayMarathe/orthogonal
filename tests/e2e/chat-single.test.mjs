@@ -1,21 +1,20 @@
 import { loadTestEnv, requireEnv } from "../lib/env.mjs";
 import {
-  getAnonymousAccessToken,
+  createTestAccessToken,
   runChatStream,
 } from "../lib/chat-client.mjs";
 
 const env = loadTestEnv();
-requireEnv(env, ["supabaseUrl", "supabaseAnonKey"]);
+requireEnv(env, ["supabaseUrl"]);
 
 const message =
   process.argv[2] ??
   "Who is on the C-suite of Stripe? Find their emails and draft a partnership outreach email.";
 const model = process.argv[3] ?? env.defaultModel;
 
-console.log("Signing in anonymously…");
-const token = await getAnonymousAccessToken(
+console.log("Creating test user…");
+const token = await createTestAccessToken(
   env.supabaseUrl,
-  env.supabaseAnonKey,
 );
 
 console.log(`Sending chat (model=${model})…\n`);

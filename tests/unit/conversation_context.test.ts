@@ -43,7 +43,7 @@ test("isNewsOrWebIntent matches news questions", () => {
   assert.equal(isNewsOrWebIntent("Shopify headcount and ICP"), false);
 });
 
-test("buildContextInjection includes prior catalog results", () => {
+test("buildContextInjection includes prior catalog results when continuing episode", () => {
   const injection = buildContextInjection(
     {
       effectiveQuery: "OpenAI enterprise news",
@@ -51,9 +51,22 @@ test("buildContextInjection includes prior catalog results", () => {
       catalogSearchResult: '{"apis":[{"slug":"perplexity"}]}',
     },
     "OpenAI enterprise news",
+    true,
   );
   assert.match(injection ?? "", /Prior catalog search results/);
   assert.match(injection ?? "", /perplexity/);
+});
+
+test("buildContextInjection skipped when not continuing episode", () => {
+  const injection = buildContextInjection(
+    {
+      activeSlug: "crustdata",
+      catalogSearchResult: '{"apis":[]}',
+    },
+    "test message",
+    false,
+  );
+  assert.equal(injection, null);
 });
 
 test("resolveInheritedTaggedApis reads @tag from prior user message", () => {
@@ -69,9 +82,17 @@ test("resolveInheritedTaggedApis reads @tag from prior user message", () => {
   assert.deepEqual(inherited, ["scrapecreators"]);
 });
 
-test("shouldInheritApiContext allows short creator follow-ups", () => {
+test("shouldInheritApiContext requires continueEpisode", () => {
   assert.equal(
-    shouldInheritApiContext("what are the popular creators?", ["scrapecreators"]),
+    shouldInheritApiContext("what are the popular creators?", ["scrapecreators"], true),
     true,
+  );
+  assert.equal(
+    shouldInheritApiContext("what are the popular creators?", ["scrapecreators"], false),
+    false,
+  );
+  assert.equal(
+    shouldInheritApiContext("test message", ["crustdata"], false),
+    false,
   );
 });

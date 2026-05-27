@@ -1,6 +1,6 @@
 import { compactToolPayloadForSummary } from "./compactToolResults.ts";
 import { formatLeadershipFromJson } from "./leadership.ts";
-import { llmChat, llmChatStream } from "./llm.ts";
+import { llmChat } from "./llm.ts";
 import type { ChatMessage, SseEvent } from "./types.ts";
 
 const SYNTHESIS_INSTRUCTION = `Write the final answer for the user based ONLY on tool results above.
@@ -168,26 +168,6 @@ export async function synthesizeFromToolResults(
   ];
 
   emit?.({ type: "thinking", label: "Writing your answer…" });
-
-  let streamed = false;
-  const streamRes = await llmChatStream(
-    model,
-    summaryMessages,
-    (token) => {
-      streamed = true;
-      emit?.({ type: "token", content: token });
-    },
-    { toolChoice: "none", maxTokens: 2048 },
-  );
-
-  if (
-    streamRes.ok &&
-    streamRes.content &&
-    !streamRes.content.includes("Request too large") &&
-    !streamRes.content.includes("Rate limit")
-  ) {
-    return { content: streamRes.content, streamed };
-  }
 
   const summaryRes = await llmChat(
     model,

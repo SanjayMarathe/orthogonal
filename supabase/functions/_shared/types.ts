@@ -72,4 +72,5 @@ export interface ChatRequest {
   stream?: boolean;
   model?: string;
   attachments?: ChatAttachment[];
+  queueMode?: "off" | "shadow" | "on";
 }

@@ -2,7 +2,6 @@ import ExtensionIcon from "@mui/icons-material/Extension";
 import { MessageSquarePlus, MessagesSquare } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Conversation } from "@/lib/supabase";
-import { ThemeToggle } from "./ThemeToggle";
 
 export type SidebarView = "chat" | "integrations";
 
@@ -46,7 +45,6 @@ export function ConversationSidebar({
             Chats
           </span>
         </div>
-        <ThemeToggle />
       </div>
 
       <div className="p-3">

@@ -120,10 +120,11 @@ export function resolveInheritedTaggedApis(
   messages: ChatMessage[],
   priorToolContext: PriorToolContext | null,
   currentTaggedApis: string[],
+  allowPriorSlug = false,
 ): string[] {
   if (currentTaggedApis.length > 0) return [];
 
-  if (priorToolContext?.activeSlug) {
+  if (allowPriorSlug && priorToolContext?.activeSlug) {
     return [priorToolContext.activeSlug.toLowerCase()];
   }
 
@@ -145,31 +146,32 @@ export function resolveInheritedTaggedApis(
 }
 
 /**
- * Continue the prior @slug session on short follow-ups ("what are the popular creators?").
+ * @deprecated Use TurnPlan.continueEpisode from episode context instead.
+ * Kept for tests — no longer uses message-length blanket inheritance.
  */
 export function shouldInheritApiContext(
   query: string,
   inheritedTaggedApis: string[],
+  continueEpisode = false,
 ): boolean {
-  if (inheritedTaggedApis.length === 0) return false;
+  if (!continueEpisode || inheritedTaggedApis.length === 0) return false;
 
-  const t = query.trim();
-  if (t.length <= 120) return true;
-
-  const lower = t.toLowerCase();
+  const lower = query.toLowerCase();
   if (isNewsOrWebIntent(query) && !/\b(tiktok|youtube|reddit|kick|creator|clip|playlist)\b/.test(lower)) {
     return false;
   }
   if (isCompanyResearchIntent(query, [])) return false;
 
-  return false;
+  return true;
 }
 
-/** Inject prior turn API context so the model and synthesizer see it. */
+/** @deprecated Prefer assembleEpisodeInjection from episodeContext.ts */
 export function buildContextInjection(
   prior: PriorToolContext | null,
   effectiveQuery: string,
+  continueEpisode = false,
 ): string | null {
+  if (!continueEpisode) return null;
   if (!prior?.catalogSearchResult && !prior?.catalogSearchPrompt && !prior?.activeSlug) {
     return null;
   }
@@ -178,16 +180,14 @@ export function buildContextInjection(
     `Resolved user intent: ${effectiveQuery}`,
   ];
   if (prior.activeSlug) {
-    parts.push(
-      `Active API from prior turn: @${prior.activeSlug}. Continue using this slug unless the user clearly switches APIs.`,
-    );
+    parts.push(`API in use: @${prior.activeSlug}`);
   }
   if (prior.catalogSearchPrompt) {
     parts.push(`Prior catalog search prompt: ${prior.catalogSearchPrompt}`);
   }
   if (prior.catalogSearchResult) {
     parts.push(
-      `Prior catalog search results (reuse — do NOT search again for affirmations like "yes do that"):\n${prior.catalogSearchResult.slice(0, 4000)}`,
+      `Prior catalog search results (reuse for affirmations only):\n${prior.catalogSearchResult.slice(0, 4000)}`,
     );
   }
   return parts.join("\n");

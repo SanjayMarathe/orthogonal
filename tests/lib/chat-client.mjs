@@ -1,36 +1,20 @@
 /**
- * Shared Supabase anonymous auth + chat SSE client for E2E tests.
+ * Shared custom-auth helper + chat SSE client for E2E tests.
  */
 
-export async function getAnonymousAccessToken(supabaseUrl, anonKey) {
-  const headers = {
-    apikey: anonKey,
-    "Content-Type": "application/json",
-  };
-
-  const anonTokenRes = await fetch(
-    `${supabaseUrl}/auth/v1/token?grant_type=anonymous`,
-    {
-      method: "POST",
-      headers: { ...headers, Authorization: `Bearer ${anonKey}` },
-    },
-  );
-  if (anonTokenRes.ok) {
-    const data = await anonTokenRes.json();
-    if (data.access_token) return data.access_token;
-  }
-
-  const signupRes = await fetch(`${supabaseUrl}/auth/v1/signup`, {
+export async function createTestAccessToken(supabaseUrl) {
+  const email = `test-${Date.now()}-${Math.random().toString(36).slice(2, 7)}@example.com`;
+  const password = "Passw0rd!Passw0rd!";
+  const res = await fetch(`${supabaseUrl}/functions/v1/auth/register`, {
     method: "POST",
-    headers,
-    body: JSON.stringify({}),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
   });
-  if (signupRes.ok) {
-    const data = await signupRes.json();
-    if (data.access_token) return data.access_token;
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body.accessToken) {
+    throw new Error(`Failed to register test user: ${JSON.stringify(body)}`);
   }
-
-  throw new Error("Failed to obtain anonymous Supabase access token");
+  return body.accessToken;
 }
 
 /**

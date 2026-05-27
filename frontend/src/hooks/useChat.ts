@@ -4,7 +4,7 @@ import type { ChatAttachment } from "@/lib/attachments";
 import { uploadChatFiles } from "@/lib/attachments";
 import { setConversationUrl } from "@/lib/chatShare";
 import type { SseEvent, ToolStep } from "@/lib/supabase";
-import { supabase } from "@/lib/supabase";
+import { ensureValidAccessToken, getAppUser } from "@/lib/appAuth";
 
 export function useChat(onConversationUpdate?: () => void) {
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
@@ -20,17 +20,43 @@ export function useChat(onConversationUpdate?: () => void) {
   }, [conversationId]);
 
   const loadMessages = useCallback(async (convId: string) => {
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-
-    const { data: conv, error: convError } = await supabase
-      .from("conversations")
-      .select("title, context_tokens, context_limit, user_id")
-      .eq("id", convId)
-      .single();
-
-    if (convError || !conv) {
+    const user = getAppUser();
+    const token = await ensureValidAccessToken();
+    if (!token) {
+      setMessages([]);
+      setConversationId(null);
+      setIsReadOnly(false);
+      return false;
+    }
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string;
+    const res = await fetch(
+      `${supabaseUrl}/functions/v1/conversations?conversationId=${encodeURIComponent(convId)}&include=messages`,
+      {
+        headers: { Authorization: `Bearer ${token}` },
+      },
+    );
+    if (!res.ok) {
+      setMessages([]);
+      setConversationId(null);
+      setIsReadOnly(false);
+      return false;
+    }
+    const payload = (await res.json()) as {
+      conversation?: {
+        title: string;
+        context_tokens: number;
+        context_limit: number;
+        user_id: string;
+      };
+      messages?: Array<{
+        id: string;
+        role: "user" | "assistant" | "system" | "tool";
+        content: string | null;
+        metadata: Record<string, unknown> | null;
+      }>;
+    };
+    const conv = payload.conversation;
+    if (!conv) {
       setMessages([]);
       setConversationId(null);
       setIsReadOnly(false);
@@ -41,12 +67,7 @@ export function useChat(onConversationUpdate?: () => void) {
     setContextTokens(conv.context_tokens);
     setContextLimit(conv.context_limit);
     setIsReadOnly(Boolean(user && conv.user_id !== user.id));
-
-    const { data } = await supabase
-      .from("messages")
-      .select("*")
-      .eq("conversation_id", convId)
-      .order("created_at", { ascending: true });
+    const data = payload.messages;
 
     if (data) {
       setMessages(
@@ -93,16 +114,12 @@ export function useChat(onConversationUpdate?: () => void) {
       const assistantId = `assistant-${Date.now()}`;
 
       try {
-        const {
-          data: { session },
-        } = await supabase.auth.getSession();
-        if (!session) throw new Error("Not authenticated");
+        const accessToken = await ensureValidAccessToken();
+        if (!accessToken) throw new Error("Not authenticated");
 
         let uploadedAttachments: ChatAttachment[] = reuseAttachments ?? [];
         if (files?.length) {
-          const {
-            data: { user },
-          } = await supabase.auth.getUser();
+          const user = getAppUser();
           if (!user) throw new Error("Not authenticated");
           uploadedAttachments = await uploadChatFiles(
             user.id,
@@ -149,7 +166,7 @@ export function useChat(onConversationUpdate?: () => void) {
         const response = await fetch(`${supabaseUrl}/functions/v1/chat`, {
           method: "POST",
           headers: {
-            Authorization: `Bearer ${session.access_token}`,
+            Authorization: `Bearer ${accessToken}`,
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
@@ -166,6 +183,84 @@ export function useChat(onConversationUpdate?: () => void) {
           throw new Error(
             (err as { error?: string }).error ?? "Chat request failed",
           );
+        }
+
+        const contentType = response.headers.get("content-type") ?? "";
+        if (contentType.includes("application/json")) {
+          const payload = (await response.json()) as {
+            queued?: boolean;
+            jobId?: string;
+            conversationId?: string;
+            content?: string;
+          };
+          if (payload.conversationId) {
+            setConversationId(payload.conversationId);
+          }
+          if (payload.queued && payload.jobId) {
+            const pollUntil = Date.now() + 120_000;
+            let content = "";
+            while (Date.now() < pollUntil) {
+              await new Promise((r) => setTimeout(r, 1500));
+              const statusRes = await fetch(
+                `${supabaseUrl}/functions/v1/chat-status?jobId=${encodeURIComponent(payload.jobId)}`,
+                {
+                  headers: { Authorization: `Bearer ${accessToken}` },
+                },
+              );
+              if (!statusRes.ok) continue;
+              const status = (await statusRes.json()) as {
+                job?: { status?: string; error?: string };
+                assistantMessage?: { content?: string; metadata?: Record<string, unknown> };
+              };
+              const st = status.job?.status;
+              if (st === "done" && status.assistantMessage) {
+                content = status.assistantMessage.content ?? "";
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === assistantId
+                      ? {
+                          ...m,
+                          content,
+                          toolSteps: (status.assistantMessage?.metadata?.toolSteps as ToolStep[] | undefined) ?? [],
+                          agentReasoning:
+                            (status.assistantMessage?.metadata?.reasoning as string | undefined) ??
+                            undefined,
+                          isStreaming: false,
+                          isThinking: false,
+                        }
+                      : m,
+                  ),
+                );
+                onConversationUpdate?.();
+                setIsLoading(false);
+                return;
+              }
+              if (st === "failed" || st === "cancelled") {
+                throw new Error(status.job?.error ?? "Queued job failed");
+              }
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId
+                    ? { ...m, isThinking: true, thinkingLabel: "Queued… waiting for worker" }
+                    : m,
+                ),
+              );
+            }
+            throw new Error("Queued job timed out");
+          }
+          if (payload.content) {
+            const queuedContent = payload.content ?? "";
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId
+                  ? { ...m, content: queuedContent, isStreaming: false, isThinking: false }
+                  : m,
+              ),
+            );
+            onConversationUpdate?.();
+            setIsLoading(false);
+            return;
+          }
         }
 
         const reader = response.body?.getReader();

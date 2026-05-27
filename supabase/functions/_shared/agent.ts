@@ -23,14 +23,21 @@ import {
 } from "./taggedApiRun.ts";
 import { tryTaggedApiIntroAnswer } from "./taggedApiIntro.ts";
 import {
-  buildContextInjection,
   buildToolContextSnapshot,
   isFollowUpAffirmation,
   resolveEffectiveUserQuery,
   resolveInheritedTaggedApis,
-  shouldInheritApiContext,
   type PriorToolContext,
 } from "./conversationContext.ts";
+import {
+  assembleEpisodeInjection,
+  buildEpisodeAfterTurn,
+  detectEpisodeBoundary,
+  episodeToToolContext,
+  priorCatalogForAffirmation,
+  shouldInheritTaggedApis,
+  type EpisodeState,
+} from "./episodeContext.ts";
 import {
   inferUseArgsFromDetails,
   isTopicSwitch,
@@ -824,7 +831,7 @@ export async function runAgentLoop(
   emit: EmitFn,
   taggedApis: string[] = [],
   model = "groq:llama-3.3-70b-versatile",
-  priorToolContext: PriorToolContext | null = null,
+  priorEpisode: EpisodeState | null = null,
 ): Promise<{
   assistantContent: string;
   toolSteps: ToolStep[];
@@ -832,38 +839,60 @@ export async function runAgentLoop(
   usageTokens?: number;
   contentStreamed: boolean;
   toolContext?: PriorToolContext;
+  episode?: EpisodeState;
 }> {
   const userMessage =
     [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
   const effectiveUserQuery = resolveEffectiveUserQuery(messages, userMessage);
   const followUpAffirmation = isFollowUpAffirmation(userMessage);
-  const inheritedRaw = resolveInheritedTaggedApis(
-    messages,
-    priorToolContext,
+  const episodeBoundary = detectEpisodeBoundary(
+    userMessage,
+    effectiveUserQuery,
+    priorEpisode,
     taggedApis,
   );
-  const apiSession = resolveApiSession(messages, priorToolContext);
-  const topicSwitch =
-    apiSession != null &&
-    isTopicSwitch(effectiveUserQuery, apiSession.activeSlug);
-  const inheritContext =
-    inheritedRaw.length > 0 &&
-    !topicSwitch &&
-    (shouldInheritApiContext(effectiveUserQuery, inheritedRaw) ||
-      (apiSession?.endpoints?.length ?? 0) > 0);
-  const inheritedTaggedApis = inheritContext ? inheritedRaw : [];
-  const routingTaggedApis =
-    taggedApis.length > 0 ? taggedApis : inheritedTaggedApis;
 
-  const intentPlan = await classifyQueryIntent(
+  const turnPlan = await classifyQueryIntent(
     model,
     messages,
     effectiveUserQuery,
     taggedApis,
-    inheritedTaggedApis,
+    priorEpisode,
+    {
+      userMessage,
+      episodeBoundary,
+      followUpAffirmation,
+    },
   );
 
-  const planNeedsTools = intentPlanNeedsTools(intentPlan);
+  const priorToolContext = priorEpisode
+    ? episodeToToolContext(priorEpisode)
+    : null;
+  const inheritTags = shouldInheritTaggedApis(
+    turnPlan,
+    priorEpisode,
+    taggedApis,
+  );
+  const inheritedTaggedApis = inheritTags
+    ? resolveInheritedTaggedApis(
+        messages,
+        priorToolContext,
+        taggedApis,
+        true,
+      )
+    : resolveInheritedTaggedApis(messages, null, taggedApis, false);
+  const routingTaggedApis =
+    taggedApis.length > 0 ? taggedApis : inheritedTaggedApis;
+
+  const apiSession = turnPlan.continueEpisode
+    ? resolveApiSession(messages, priorToolContext)
+    : resolveApiSession(messages, null);
+  const topicSwitch =
+    apiSession != null &&
+    isTopicSwitch(effectiveUserQuery, apiSession.activeSlug);
+
+  const intentPlan: IntentPlan = turnPlan;
+  const planNeedsTools = intentPlanNeedsTools(turnPlan);
 
   if (!planNeedsTools) {
     const { assistantContent, contentStreamed } = await answerDirectly(
@@ -878,6 +907,7 @@ export async function runAgentLoop(
       usageTokens: undefined,
       contentStreamed,
       toolContext: undefined,
+      episode: undefined,
     };
   }
 
@@ -898,7 +928,7 @@ export async function runAgentLoop(
 
   appendAgentReasoning(
     emitLive,
-    `Routing as ${intentPlanSummary(intentPlan)}.\n`,
+    `Routing as ${intentPlanSummary(intentPlan)}${turnPlan.continueEpisode ? " (same episode)" : ""}.\n`,
   );
 
   const intro =
@@ -923,6 +953,15 @@ export async function runAgentLoop(
             activeSlug: taggedApis[0]?.toLowerCase(),
             effectiveQuery: userMessage,
           },
+      episode: buildEpisodeAfterTurn({
+        priorEpisode,
+        intent: "capability",
+        effectiveQuery: userMessage,
+        activeSlug: primary?.activeSlug ?? taggedApis[0]?.toLowerCase(),
+        endpoints: primary?.endpoints,
+        toolSteps: intro.toolSteps,
+        continueEpisode: true,
+      }),
     };
   }
 
@@ -934,19 +973,27 @@ export async function runAgentLoop(
       `\n\nThe user tagged these Orthogonal API handles: ${taggedApis.map((s) => `@${s}`).join(", ")}. ` +
       "Use orthogonal_get_details and orthogonal_use with these api slugs. Do NOT call orthogonal_search unless you need a different API. " +
       "For @openfunnel: account/people filters, audience creation, and audience listing.";
-  } else if (routingTaggedApis.length > 0) {
+  } else if (
+    turnPlan.continueEpisode &&
+    routingTaggedApis.length > 0
+  ) {
     systemPrompt +=
       `\n\nThe user is continuing a session with @${routingTaggedApis[0]} from a prior turn. ` +
       "Use orthogonal_get_details and orthogonal_use with that api slug. Do NOT switch to scrapegraphai or company-enrich unless they ask for a different API.";
   }
-  const contextInjection = buildContextInjection(
-    priorToolContext,
+  const contextInjection = assembleEpisodeInjection(
+    priorEpisode,
+    turnPlan.continueEpisode,
     effectiveUserQuery,
   );
   if (contextInjection) {
     systemPrompt += `\n\n${contextInjection}`;
   }
-  if (apiSession?.endpoints?.length && inheritedTaggedApis.length > 0) {
+  if (
+    turnPlan.continueEpisode &&
+    apiSession?.endpoints?.length &&
+    inheritedTaggedApis.length > 0
+  ) {
     systemPrompt += `\n\n${sessionContextInjection(apiSession)}`;
   }
   const workingMessages: ChatMessage[] = [
@@ -973,7 +1020,10 @@ export async function runAgentLoop(
 
   let sessionLastEndpoint = apiSession?.lastEndpoint;
   const sessionResult =
-    apiSession && !topicSwitch && routingTaggedApis.length > 0
+    turnPlan.continueEpisode &&
+    apiSession &&
+    !topicSwitch &&
+    routingTaggedApis.length > 0
       ? await runSessionFollowUpPipeline(
           apiSession,
           effectiveUserQuery,
@@ -1003,8 +1053,9 @@ export async function runAgentLoop(
       toolSteps,
       emitLive,
       cache,
-      priorToolContext,
-      followUpAffirmation,
+      priorCatalogForAffirmation(priorEpisode) ??
+        (turnPlan.continueEpisode ? priorToolContext : null),
+      followUpAffirmation && turnPlan.continueEpisode,
     );
   }
 
@@ -1102,24 +1153,36 @@ export async function runAgentLoop(
   }
 
   const hasToolContext = toolSteps.length > 0 || intentPlan.directApis.length > 0;
-  const toolContext = hasToolContext
-    ? {
-        ...captureCatalogSearchContext(
-          intentPlan.topicQuery,
-          toolSteps,
-          workingMessages,
-        ),
+  const catalogCtx = hasToolContext
+    ? captureCatalogSearchContext(
+        effectiveUserQuery,
+        toolSteps,
+        workingMessages,
+      )
+    : null;
+
+  const episode = hasToolContext
+    ? buildEpisodeAfterTurn({
+        priorEpisode: turnPlan.continueEpisode ? priorEpisode : null,
         intent: intentPlan.intent,
-        catalogSearchPrompt: intentPlan.catalogSearchPrompt,
+        effectiveQuery: effectiveUserQuery,
         activeSlug:
           taggedApis[0]?.toLowerCase() ??
           apiSession?.activeSlug ??
           intentPlan.directApis[0]?.slug ??
-          priorToolContext?.activeSlug,
-        endpoints: apiSession?.endpoints ?? priorToolContext?.endpoints,
-        lastEndpoint: sessionLastEndpoint ?? priorToolContext?.lastEndpoint,
-      }
+          priorEpisode?.activeSlug,
+        endpoints: apiSession?.endpoints ?? priorEpisode?.endpoints,
+        toolSteps,
+        catalogSearchPrompt: intentPlan.catalogSearchPrompt,
+        catalogSearchResult: catalogCtx?.catalogSearchResult,
+        continueEpisode: turnPlan.continueEpisode,
+      })
     : undefined;
+
+  const toolContext = episode ? episodeToToolContext(episode) : undefined;
+  if (toolContext && sessionLastEndpoint) {
+    toolContext.lastEndpoint = sessionLastEndpoint;
+  }
 
   return {
     assistantContent,
@@ -1128,6 +1191,7 @@ export async function runAgentLoop(
     usageTokens,
     contentStreamed,
     toolContext,
+    episode,
   };
 }
 

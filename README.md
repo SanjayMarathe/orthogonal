@@ -17,7 +17,7 @@ The app uses an **agent-with-tools** pattern:
 
 **Why Baseten via Orthogonal?** One API key powers both the LLM and all marketplace APIs — no separate OpenAI key needed.
 
-**Why Anonymous Auth?** Fastest path to persistent per-browser conversations for the take-home demo. Upgrade to email auth in production.
+**Why custom email/password auth?** The app now uses app-owned users and JWT sessions (without Supabase Auth), so conversation access is scoped by app user identity and enforced by RLS.
 
 ## System Design
 
@@ -29,7 +29,7 @@ flowchart TB
   end
 
   subgraph supabase [Supabase]
-    Auth[Anonymous Auth]
+    AuthFn[Edge Function: auth]
     DB[(Postgres)]
     EF[Edge Function: chat]
   end
@@ -42,7 +42,8 @@ flowchart TB
   end
 
   UI --> SBClient
-  SBClient --> Auth
+  UI -->|register/login/refresh| AuthFn
+  AuthFn --> DB
   SBClient --> DB
   UI -->|SSE stream| EF
   EF --> Search
@@ -54,17 +55,56 @@ flowchart TB
 
 ### Database Schema
 
-- **`conversations`** — thread metadata, title, `context_tokens`, `context_summary`
-- **`messages`** — user/assistant/system messages with `metadata.toolSteps` for UI replay
-- **RLS** — users can only access their own conversations and messages
+- **`app_users`** — application identities (email-based accounts)
+- **`app_user_credentials`** — password hash metadata per user
+- **`app_sessions`** — refresh-session tracking with revocation and expiry
+- **`conversations`** — thread metadata, ownership (`user_id`), title, context usage
+- **`messages`** — chat timeline + tool metadata for replay
+- **RLS** — all access checks use `current_app_user_id()` extracted from JWT claims, plus optional `is_public` read sharing
 
 ### Edge Function Responsibilities
 
-- Authenticate via Supabase JWT
+- Authenticate via custom JWT (`APP_JWT_SECRET`)
 - Handle `/clear` and `/compress` slash commands
 - Run agent loop (max 8 tool iterations)
 - Emit SSE events: `tool_start`, `tool_done`, `token`, `done`
 - Persist messages and update token counts
+
+## System Design
+
+### Databases and State Stores
+
+- **Primary database:** Supabase Postgres for OLTP data (`app_users`, `app_user_credentials`, `app_sessions`, `conversations`, `messages`)
+- **Object storage:** Supabase Storage for chat attachments (folder partitioned by app user id)
+- **Optional at scale:** Redis/Upstash for login rate-limit counters and short-lived auth/session cache
+
+### Request and Auth Architecture
+
+```mermaid
+flowchart LR
+  user[UserBrowser] --> authApi["Edge: /auth"]
+  authApi --> pg[(Postgres)]
+  user --> appClient[React + SupabaseJS]
+  appClient --> postgrest[Supabase PostgREST]
+  appClient --> chatApi["Edge: /chat"]
+  chatApi --> orth[Orthogonal APIs + LLM]
+  chatApi --> pg
+  postgrest --> pg
+```
+
+- User signs up/logs in via `auth` edge function.
+- `auth` issues app JWT + refresh token; refresh token hash is persisted in `app_sessions`.
+- Frontend sends access JWT as bearer token to PostgREST + edge functions.
+- Postgres RLS resolves app identity using `current_app_user_id()` from JWT claims.
+- `chat` edge function orchestrates tool calls and persists message history, so users can leave and return with full conversation state.
+
+### Scaling Approach
+
+- **Stateless edge compute:** `auth`, `chat`, `models`, and `integrations` can scale horizontally behind Supabase edge runtime.
+- **DB scaling:** indexed chat access paths (`messages(conversation_id, created_at)`, ownership/session indexes), with read replicas for high read volume.
+- **Message growth:** if needed, partition `messages` by time/tenant while preserving conversation-local query performance.
+- **Auth throughput:** move rate-limit counters + session hot-path lookups to Redis when login/refresh traffic grows.
+- **Async heavy work:** offload expensive analytics/summarization to background workers to keep chat latency low.
 
 ## Setup
 
@@ -73,7 +113,7 @@ flowchart TB
 - Node.js 18+
 - [Supabase CLI](https://supabase.com/docs/guides/cli)
 - Orthogonal API key ([dashboard](https://orthogonal.com/dashboard/settings/api-keys))
-- Supabase project with **Anonymous Auth enabled**
+- Supabase project with custom auth secrets configured
 
 > **Security:** Never commit API keys. Rotate any key that was shared in chat.
 
@@ -88,12 +128,27 @@ supabase db push
 
 # Set secrets
 supabase secrets set ORTHOGONAL_API_KEY=orth_live_your_key
+supabase secrets set APP_JWT_SECRET=your_project_jwt_secret
+supabase secrets set SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
 
-# Deploy edge function
+# Deploy edge functions
 supabase functions deploy chat
-```
+supabase functions deploy auth
+supabase functions deploy chat-worker --no-verify-jwt
+supabase functions deploy chat-status --no-verify-jwt
+supabase functions deploy conversations --no-verify-jwt
 
-Enable Anonymous sign-ins: **Dashboard → Authentication → Providers → Anonymous**.
+# Queue worker (async chat jobs)
+supabase secrets set CHAT_QUEUE_MODE=on
+supabase secrets set QUEUE_WORKER_SECRET="$(openssl rand -hex 32)"
+supabase db push   # applies 006_queue_worker_cron.sql (pg_cron every minute)
+
+# Store cron HTTP credentials in Vault (must match QUEUE_WORKER_SECRET)
+npx supabase@latest db query --linked --yes "
+  select vault.create_secret('https://YOUR_PROJECT_REF.supabase.co', 'project_url');
+  select vault.create_secret('YOUR_QUEUE_WORKER_SECRET', 'queue_worker_secret');
+"
+```
 
 ### 2. Frontend
 
@@ -189,7 +244,6 @@ tests/
 
 ## With More Time
 
-- Email auth upgrade and conversation sharing
 - Tiktoken-accurate token counting
 - Integration OAuth UI in-app
 - Cost dashboard per conversation

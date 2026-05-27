@@ -7,7 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { DEFAULT_MODEL_ID, type LlmModel } from "@/lib/models";
-import { supabase } from "@/lib/supabase";
+import { ensureValidAccessToken, subscribeAuthChange } from "@/lib/appAuth";
 
 const STORAGE_KEY = "orthogonal-model";
 
@@ -39,14 +39,12 @@ export function ModelsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     async function load() {
       try {
-        const {
-          data: { session },
-        } = await supabase.auth.getSession();
-        if (!session) return;
+        const token = await ensureValidAccessToken();
+        if (!token) return;
 
         const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string;
         const response = await fetch(`${supabaseUrl}/functions/v1/models`, {
-          headers: { Authorization: `Bearer ${session.access_token}` },
+          headers: { Authorization: `Bearer ${token}` },
         });
         if (!response.ok) return;
 
@@ -66,6 +64,11 @@ export function ModelsProvider({ children }: { children: ReactNode }) {
       }
     }
     load();
+    return subscribeAuthChange(() => {
+      setModels([]);
+      setModelsLoading(true);
+      void load();
+    });
   }, []);
 
   const selectedModel = models.find((m) => m.id === selectedModelId);

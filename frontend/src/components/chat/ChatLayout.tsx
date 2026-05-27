@@ -16,7 +16,14 @@ import { getConversationIdFromUrl } from "@/lib/chatShare";
 import { IntegrationsProvider } from "@/hooks/useIntegrations";
 import { ModelsProvider, useModels } from "@/hooks/useModels";
 import { ThemeToggle } from "./ThemeToggle";
-import { supabase } from "@/lib/supabase";
+import {
+  getAppUser,
+  loginWithEmail,
+  logoutAppUser,
+  registerWithEmail,
+  subscribeAuthChange,
+  type AppUser,
+} from "@/lib/appAuth";
 
 function ChatLayoutInner() {
   const { selectedModelId } = useModels();
@@ -37,32 +44,37 @@ function ChatLayoutInner() {
   } = useChat(refresh);
 
   const [authReady, setAuthReady] = useState(false);
+  const [authUser, setAuthUser] = useState<AppUser | null>(null);
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
   const [sharedLoadDone, setSharedLoadDone] = useState(false);
   const [view, setView] = useState<SidebarView>("chat");
   const [inputPrefill, setInputPrefill] = useState<string | undefined>();
 
   useEffect(() => {
-    async function initAuth() {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-      if (!session) {
-        await supabase.auth.signInAnonymously();
+    setAuthUser(getAppUser());
+    setAuthReady(true);
+    return subscribeAuthChange(() => {
+      setAuthUser(getAppUser());
+      setSharedLoadDone(false);
+      if (!getAppUser()) {
+        resetChat();
       }
-      setAuthReady(true);
-    }
-    initAuth();
+    });
   }, []);
 
   useEffect(() => {
-    if (!authReady || sharedLoadDone) return;
+    if (!authReady || !authUser || sharedLoadDone) return;
     const urlId = getConversationIdFromUrl();
     if (urlId) {
       void loadMessages(urlId).finally(() => setSharedLoadDone(true));
     } else {
       setSharedLoadDone(true);
     }
-  }, [authReady, sharedLoadDone, loadMessages]);
+  }, [authReady, authUser, sharedLoadDone, loadMessages]);
 
   const handleNewChat = async () => {
     setView("chat");
@@ -99,8 +111,83 @@ function ChatLayoutInner() {
     );
   }
 
+  const handleAuthSubmit = async () => {
+    setAuthError(null);
+    setAuthSubmitting(true);
+    try {
+      if (authMode === "register") {
+        await registerWithEmail(email, password);
+      } else {
+        await loginWithEmail(email, password);
+      }
+      setEmail("");
+      setPassword("");
+      await refresh();
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : "Authentication failed");
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  if (!authUser) {
+    return (
+      <div className="relative flex h-full items-center justify-center bg-white dark:bg-gray-900">
+        <div className="absolute right-4 top-4">
+          <ThemeToggle />
+        </div>
+        <div className="w-full max-w-sm rounded-xl border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-900">
+          <h2 className="mb-2 text-lg font-semibold text-gray-900 dark:text-gray-100">
+            {authMode === "login" ? "Sign in" : "Create account"}
+          </h2>
+          <p className="mb-4 text-sm text-gray-500 dark:text-gray-400">
+            Email/password auth is required to access your conversations.
+          </p>
+          <div className="space-y-3">
+            <input
+              className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-800"
+              type="email"
+              placeholder="you@company.com"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+            />
+            <input
+              className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-800"
+              type="password"
+              placeholder="Password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+            {authError ? (
+              <p className="text-sm text-red-600 dark:text-red-400">{authError}</p>
+            ) : null}
+            <button
+              className="w-full rounded-md bg-gray-900 px-3 py-2 text-sm text-white disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900"
+              onClick={handleAuthSubmit}
+              disabled={authSubmitting || !email || !password}
+            >
+              {authSubmitting
+                ? "Please wait…"
+                : authMode === "login"
+                  ? "Sign in"
+                  : "Create account"}
+            </button>
+            <button
+              className="w-full text-sm text-gray-600 underline dark:text-gray-300"
+              onClick={() => setAuthMode((m) => (m === "login" ? "register" : "login"))}
+            >
+              {authMode === "login"
+                ? "Need an account? Register"
+                : "Already have an account? Sign in"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex h-full bg-white dark:bg-gray-900">
+    <div className="relative flex h-full bg-white dark:bg-gray-900">
       <ConversationSidebar
         conversations={conversations}
         currentConversationId={conversationId}
@@ -153,6 +240,12 @@ function ChatLayoutInner() {
           </>
         )}
       </div>
+      <button
+        className="absolute bottom-4 right-4 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-xs text-gray-600 dark:border-gray-800 dark:bg-gray-900 dark:text-gray-300"
+        onClick={() => void logoutAppUser()}
+      >
+        Sign out
+      </button>
     </div>
   );
 }

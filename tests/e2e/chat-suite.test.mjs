@@ -6,7 +6,7 @@
 
 import { loadTestEnv, requireEnv } from "../lib/env.mjs";
 import {
-  getAnonymousAccessToken,
+  createTestAccessToken,
   runChatStream,
 } from "../lib/chat-client.mjs";
 
@@ -21,7 +21,7 @@ if (!force) {
 }
 
 const env = loadTestEnv();
-requireEnv(env, ["supabaseUrl", "supabaseAnonKey"]);
+requireEnv(env, ["supabaseUrl"]);
 
 const CASES = [
   {
@@ -61,10 +61,9 @@ const CASES = [
   },
 ];
 
-console.log("Signing in anonymously…");
-const token = await getAnonymousAccessToken(
+console.log("Creating test user…");
+const token = await createTestAccessToken(
   env.supabaseUrl,
-  env.supabaseAnonKey,
 );
 
 const results = [];

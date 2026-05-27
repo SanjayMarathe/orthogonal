@@ -14,7 +14,7 @@
 
 import { loadTestEnv, requireEnv } from "../lib/env.mjs";
 import {
-  getAnonymousAccessToken,
+  createTestAccessToken,
   runChatStream,
 } from "../lib/chat-client.mjs";
 import {
@@ -35,7 +35,7 @@ if (!force) {
 }
 
 const env = loadTestEnv();
-requireEnv(env, ["supabaseUrl", "supabaseAnonKey"]);
+requireEnv(env, ["supabaseUrl"]);
 
 const slugFilter = process.env.TEST_API_SLUG?.toLowerCase();
 const phase = process.env.TEST_E2E_PHASE ?? "all";
@@ -73,10 +73,9 @@ for (const api of matrix) {
   }
 }
 
-console.log("Signing in anonymously…");
-const token = await getAnonymousAccessToken(
+console.log("Creating test user…");
+const token = await createTestAccessToken(
   env.supabaseUrl,
-  env.supabaseAnonKey,
 );
 console.log(`Running ${cases.length} chat cases (${matrix.length} APIs, phase=${phase})…\n`);
 

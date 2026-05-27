@@ -4,13 +4,19 @@ import {
   processAttachmentsForMessage,
   validateAttachmentPaths,
 } from "../_shared/attachments.ts";
+import { requireAppUser } from "../_shared/auth.ts";
 import { compressMessages, runAgentLoop, streamTokens } from "../_shared/agent.ts";
-import { priorContextFromMetadata } from "../_shared/conversationContext.ts";
+import { episodeFromMetadata } from "../_shared/episodeContext.ts";
 import { extractTaggedSlugs } from "../_shared/integrations.ts";
 import { getDefaultModelId } from "../_shared/models.ts";
 import { corsHeaders, handleCors } from "../_shared/cors.ts";
 import { estimateMessagesTokens, estimateTokens } from "../_shared/tokens.ts";
 import type { ChatMessage, ChatRequest, SseEvent } from "../_shared/types.ts";
+import {
+  buildIdempotencyKey,
+  enqueueJob,
+  recordQueueEvent,
+} from "../_shared/queue.ts";
 
 function sseLine(event: SseEvent): string {
   return `data: ${JSON.stringify(event)}\n\n`;
@@ -29,41 +35,23 @@ const SSE_HEADERS = {
   "X-Accel-Buffering": "no",
 };
 
+const CHAT_QUEUE_MODE = (Deno.env.get("CHAT_QUEUE_MODE") ?? "off").toLowerCase();
+
 Deno.serve(async (req) => {
   const cors = handleCors(req);
   if (cors) return cors;
 
   try {
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader) {
-      return new Response(JSON.stringify({ error: "Missing authorization" }), {
-        status: 401,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
+    const appUser = await requireAppUser(req);
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
-    const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-      global: { headers: { Authorization: authHeader } },
-    });
-
-    const {
-      data: { user },
-      error: userError,
-    } = await supabase.auth.getUser();
-    if (userError || !user) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
+    const serviceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabase = createClient(supabaseUrl, serviceRole);
 
     const body = (await req.json()) as ChatRequest;
-    const { message, stream = true, model: requestedModel, attachments: rawAttachments = [] } = body;
+    const { message, stream = true, model: requestedModel, attachments: rawAttachments = [], queueMode } = body;
     const model = requestedModel?.trim() || getDefaultModelId();
     let conversationId = body.conversationId;
-    const attachments = validateAttachmentPaths(user.id, rawAttachments ?? []);
+    const attachments = validateAttachmentPaths(appUser.app_user_id, rawAttachments ?? []);
 
     const trimmed = (message ?? "").trim();
     if (!trimmed && attachments.length === 0) {
@@ -77,7 +65,7 @@ Deno.serve(async (req) => {
       const title = generateTitle(trimmed);
       const { data: conv, error: convError } = await supabase
         .from("conversations")
-        .insert({ user_id: user.id, title })
+        .insert({ user_id: appUser.app_user_id, title })
         .select("id, context_tokens, context_limit")
         .single();
       if (convError) throw convError;
@@ -85,10 +73,27 @@ Deno.serve(async (req) => {
     } else {
       const { data: conv, error: convError } = await supabase
         .from("conversations")
-        .select("id, context_tokens, context_limit")
+        .select("id, user_id, context_tokens, context_limit, is_public")
         .eq("id", conversationId)
-        .single();
+        .maybeSingle();
       if (convError || !conv) throw new Error("Conversation not found");
+      const canAccess =
+        conv.user_id === appUser.app_user_id || conv.is_public === true;
+      if (!canAccess) {
+        return new Response(JSON.stringify({ error: "Forbidden" }), {
+          status: 403,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      if (conv.user_id !== appUser.app_user_id) {
+        return new Response(
+          JSON.stringify({ error: "Cannot write to shared conversation" }),
+          {
+            status: 403,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          },
+        );
+      }
     }
 
     // Slash: /clear
@@ -298,6 +303,68 @@ Deno.serve(async (req) => {
       },
     });
 
+    const effectiveQueueMode = (queueMode ?? CHAT_QUEUE_MODE) as "off" | "shadow" | "on";
+    if (effectiveQueueMode === "on" || effectiveQueueMode === "shadow") {
+      const idempotencyKey = await buildIdempotencyKey({
+        userId: appUser.app_user_id,
+        conversationId,
+        prompt: trimmed,
+        model,
+        attachments,
+      });
+      const job = await enqueueJob(supabase, {
+        conversationId,
+        userId: appUser.app_user_id,
+        messageId: null,
+        idempotencyKey,
+        requestPayload: {
+          conversationId,
+          message: trimmed,
+          model,
+          attachments,
+          queuedBy: "chat",
+        },
+      });
+      await recordQueueEvent(supabase, job.id, "enqueued", {
+        mode: effectiveQueueMode,
+        streamRequested: stream,
+      });
+
+      if (effectiveQueueMode === "on") {
+        if (stream) {
+          const encoder = new TextEncoder();
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.enqueue(encoder.encode(sseLine({ type: "conversation", conversationId })));
+                controller.enqueue(encoder.encode(sseLine({ type: "thinking", label: "Queued for processing…" })));
+                controller.enqueue(
+                  encoder.encode(
+                    sseLine({
+                      type: "done",
+                      conversationId,
+                      message: "queued",
+                    }),
+                  ),
+                );
+                controller.close();
+              },
+            }),
+            { headers: SSE_HEADERS },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            conversationId,
+            queued: true,
+            jobId: job.id,
+            status: job.status,
+          }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+    }
+
     const { count } = await supabase
       .from("messages")
       .select("*", { count: "exact", head: true })
@@ -338,7 +405,7 @@ Deno.serve(async (req) => {
     const priorAssistant = (history ?? [])
       .filter((m) => m.role === "assistant")
       .pop();
-    const priorToolContext = priorContextFromMetadata(
+    const priorEpisode = episodeFromMetadata(
       priorAssistant?.metadata as Record<string, unknown> | null,
     );
 
@@ -393,12 +460,13 @@ Deno.serve(async (req) => {
                 usageTokens,
                 contentStreamed,
                 toolContext,
+                episode,
               } = await runAgentLoop(
                 chatMessages,
                 emit,
                 taggedApis,
                 model,
-                priorToolContext,
+                priorEpisode,
               );
 
               const finalContent =
@@ -423,6 +491,7 @@ Deno.serve(async (req) => {
                   toolSteps,
                   reasoning: reasoningLog,
                   toolContext,
+                  episode,
                 },
               });
 
@@ -467,13 +536,13 @@ Deno.serve(async (req) => {
       );
     }
 
-    const { assistantContent, toolSteps, reasoningLog, usageTokens, toolContext } =
+    const { assistantContent, toolSteps, reasoningLog, usageTokens, toolContext, episode } =
       await runAgentLoop(
         chatMessages,
         () => {},
         taggedApis,
         model,
-        priorToolContext,
+        priorEpisode,
       );
 
     const finalContent = assistantContent + contextWarning;
@@ -483,7 +552,7 @@ Deno.serve(async (req) => {
       role: "assistant",
       content: finalContent,
       token_count: estimateTokens(finalContent),
-      metadata: { toolSteps, reasoning: reasoningLog, toolContext },
+      metadata: { toolSteps, reasoning: reasoningLog, toolContext, episode },
     });
 
     const { data: allMsgs } = await supabase
@@ -521,8 +590,10 @@ Deno.serve(async (req) => {
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : "Internal server error";
+    const status =
+      /Missing authorization|Unauthorized/.test(message) ? 401 : 500;
     return new Response(JSON.stringify({ error: message }), {
-      status: 500,
+      status,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }

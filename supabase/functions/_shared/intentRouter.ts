@@ -1,4 +1,7 @@
 import type { ChatMessage } from "./types.ts";
+import type { EpisodeState } from "./episodeContext.ts";
+import { detectEpisodeBoundary, toTurnPlan } from "./episodeContext.ts";
+import { isFollowUpAffirmation } from "./conversationContext.ts";
 import { isCompanyResearchIntent, hasTaggedRunSpec } from "./taggedApiRun.ts";
 import { isNewsOrWebIntent } from "./conversationContext.ts";
 import { llmChat } from "./llm.ts";
@@ -24,6 +27,8 @@ export type IntentPlan = {
   confidence: "high" | "medium" | "low";
   source: "rules" | "llm" | "rules+llm";
 };
+
+export type { TurnPlan } from "./episodeContext.ts";
 
 const NON_COMPANY_TAGS = new Set([
   "perplexity",
@@ -130,12 +135,15 @@ export function planFromTaggedApis(
 
 const INTENT_CLASSIFIER_SYSTEM = `You decide whether the user's message needs Orthogonal API tools. Output ONLY valid JSON (no markdown).
 
-Default: general chat does NOT need tools — set skipCatalogSearch and skipLlmToolRound to true.
+Default: general chat does NOT need tools — set skipCatalogSearch and skipLlmToolRound to true, continueEpisode to false.
 
 Set skipCatalogSearch and skipLlmToolRound to false ONLY when the user clearly wants live external data: company enrichment, news/current events, web scrape, contacts/decision makers, or which API to use for a data task.
 
+Set continueEpisode to true ONLY when the user is clearly continuing the same task as the prior episode summary (follow-up on same company, same API, "find VP Product", "yes do that"). Casual messages, greetings, unrelated questions, or "test message" → continueEpisode false.
+
 Company names in the question (OpenAI, Stripe) are topics — NOT API slugs. News about OpenAI → intent web_search, primaryApi perplexity, skipCatalogSearch false.
-If Active API from prior turn is set, keep that slug for follow-ups on the same API.
+
+Do NOT assume tools are needed just because a prior episode exists. Classify the CURRENT message.
 
 JSON:
 {
@@ -144,7 +152,8 @@ JSON:
   "catalogSearchPrompt": "capability keywords for catalog search, never bare brand name",
   "primaryApi": "perplexity|company-enrich|crustdata|parallel|scrapegraphai|scrapecreators|null",
   "skipCatalogSearch": true,
-  "skipLlmToolRound": true
+  "skipLlmToolRound": true,
+  "continueEpisode": false
 }`;
 
 function parseClassifierJson(raw: string): Record<string, unknown> | null {
@@ -204,28 +213,94 @@ function planFromLlmJson(
   };
 }
 
-/** Merge rule plan with LLM when rules are low-confidence or missing. */
+function parseContinueEpisode(parsed: Record<string, unknown>): boolean {
+  return parsed.continueEpisode === true;
+}
+
 /**
  * Classify intent before any tool calls.
  * Rules handle clear cases; LLM resolves ambiguous queries.
  */
 export async function classifyQueryIntent(
-  model: string,
+  _model: string,
   messages: ChatMessage[],
   topicQuery: string,
   taggedApis: string[],
-  inheritedTaggedApis: string[] = [],
-): Promise<IntentPlan> {
-  const sessionTags =
-    taggedApis.length > 0 ? taggedApis : inheritedTaggedApis;
-  const taggedPlan = planFromTaggedApis(topicQuery, sessionTags);
-  if (taggedPlan) return taggedPlan;
+  priorEpisode: EpisodeState | null = null,
+  opts?: {
+    userMessage?: string;
+    episodeBoundary?: boolean;
+    followUpAffirmation?: boolean;
+  },
+): Promise<import("./episodeContext.ts").TurnPlan> {
+  const userMessage = opts?.userMessage ?? topicQuery;
+  const episodeBoundary =
+    opts?.episodeBoundary ??
+    detectEpisodeBoundary(userMessage, topicQuery, priorEpisode, taggedApis);
+  const followUpAffirmation = opts?.followUpAffirmation ?? false;
+
+  if (taggedApis.length > 0) {
+    const taggedPlan = planFromTaggedApis(topicQuery, taggedApis);
+    if (taggedPlan) {
+      return toTurnPlan(taggedPlan, {
+        continueEpisode: true,
+        episodeBoundary: false,
+      });
+    }
+  }
+
+  if (episodeBoundary) {
+    const casualPlan: IntentPlan = {
+      intent: "api_discovery",
+      topicQuery,
+      catalogSearchPrompt: buildCatalogSearchPrompt("api_discovery", topicQuery),
+      directApis: [],
+      skipCatalogSearch: true,
+      skipLlmToolRound: true,
+      confidence: "high",
+      source: "rules",
+    };
+    return toTurnPlan(casualPlan, {
+      continueEpisode: false,
+      episodeBoundary: true,
+    });
+  }
+
+  if (
+    followUpAffirmation &&
+    priorEpisode &&
+    (priorEpisode.toolFacts || priorEpisode.catalogSearchResult || priorEpisode.activeSlug)
+  ) {
+    const intent = (priorEpisode.intent ?? "api_discovery") as QueryIntent;
+    const plan: IntentPlan = {
+      intent,
+      topicQuery,
+      catalogSearchPrompt:
+        priorEpisode.catalogSearchPrompt ??
+        buildCatalogSearchPrompt(intent, topicQuery),
+      directApis: priorEpisode.activeSlug
+        ? [{ slug: priorEpisode.activeSlug, reason: "affirmation follow-up" }]
+        : [],
+      skipCatalogSearch: !priorEpisode.catalogSearchResult,
+      skipLlmToolRound: false,
+      confidence: "high",
+      source: "rules",
+    };
+    return toTurnPlan(plan, {
+      continueEpisode: true,
+      episodeBoundary: false,
+    });
+  }
 
   const recent = messages
     .filter((m) => m.role === "user" || m.role === "assistant")
     .slice(-4)
     .map((m) => `${m.role}: ${m.content ?? ""}`)
     .join("\n");
+
+  const episodeBlock = priorEpisode?.summary
+    ? `Prior episode summary (context only — do not auto-continue unless user asks):\n${priorEpisode.summary.slice(0, 500)}\n`
+    : "";
 
   const res = await llmChat(
     INTENT_CLASSIFIER_MODEL,
@@ -234,51 +309,60 @@ export async function classifyQueryIntent(
       {
         role: "user",
         content:
+          `${episodeBlock}` +
           `Recent conversation:\n${recent}\n\n` +
           `Query to classify: ${topicQuery}\n` +
-          `Tagged APIs (current message): ${taggedApis.length ? taggedApis.join(", ") : "none"}\n` +
-          `Active API from prior turn: ${inheritedTaggedApis.length ? inheritedTaggedApis.join(", ") : "none"}`,
+          `Tagged APIs (current message): ${taggedApis.length ? taggedApis.join(", ") : "none"}`,
       },
     ],
     undefined,
-    { toolChoice: "none", maxTokens: 200 },
+    { toolChoice: "none", maxTokens: 220 },
   );
 
-  if (!res.ok) {
-    return {
-      intent: "api_discovery",
-      topicQuery,
-      catalogSearchPrompt: buildCatalogSearchPrompt("api_discovery", topicQuery),
-      directApis: [],
-      skipCatalogSearch: true,
-      skipLlmToolRound: true,
-      confidence: "low",
-      source: "rules",
-    };
-  }
+  const fallbackPlan = (): import("./episodeContext.ts").TurnPlan => {
+    const needsTools =
+      isCompanyResearchIntent(topicQuery, taggedApis) ||
+      isNewsOrWebIntent(topicQuery);
+    const intent: QueryIntent = isNewsOrWebIntent(topicQuery)
+      ? "web_search"
+      : isCompanyResearchIntent(topicQuery, taggedApis)
+        ? "company_research"
+        : "api_discovery";
+    return toTurnPlan(
+      {
+        intent,
+        topicQuery,
+        catalogSearchPrompt: buildCatalogSearchPrompt(intent, topicQuery),
+        directApis: needsTools && intent === "web_search"
+          ? [{ slug: "perplexity", reason: "web_search fallback" }]
+          : [],
+        skipCatalogSearch: !needsTools,
+        skipLlmToolRound: !needsTools,
+        confidence: "low",
+        source: "rules",
+      },
+      { continueEpisode: false, episodeBoundary: false },
+    );
+  };
+
+  if (!res.ok) return fallbackPlan();
 
   const choice = (res.data.choices as Array<Record<string, unknown>>)?.[0];
   const message = choice?.message as Record<string, unknown> | undefined;
   const content = (message?.content as string) ?? "";
   const parsed = parseClassifierJson(content);
-  if (!parsed) {
-    return {
-      intent: "api_discovery",
-      topicQuery,
-      catalogSearchPrompt: buildCatalogSearchPrompt("api_discovery", topicQuery),
-      directApis: [],
-      skipCatalogSearch: true,
-      skipLlmToolRound: true,
-      confidence: "low",
-      source: "rules",
-    };
-  }
+  if (!parsed) return fallbackPlan();
 
-  return planFromLlmJson(parsed, topicQuery);
+  const plan = planFromLlmJson(parsed, topicQuery);
+  let continueEpisode = parseContinueEpisode(parsed);
+
+  if (episodeBoundary) continueEpisode = false;
+  if (!intentPlanNeedsTools(plan)) continueEpisode = false;
+
+  return toTurnPlan(plan, { continueEpisode, episodeBoundary });
 }
 
 export function intentPlanSummary(plan: IntentPlan): string {
   const apis = plan.directApis.map((a) => a.slug).join(", ") || "catalog search";
   return `${plan.intent} → ${apis}`;
 }
-

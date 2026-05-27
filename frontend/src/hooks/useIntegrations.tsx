@@ -7,7 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import type { OrthogonalIntegration } from "@/lib/integrations";
-import { supabase } from "@/lib/supabase";
+import { ensureValidAccessToken, subscribeAuthChange } from "@/lib/appAuth";
 
 type IntegrationsContextValue = {
   integrations: OrthogonalIntegration[];
@@ -33,10 +33,8 @@ export function IntegrationsProvider({ children }: { children: ReactNode }) {
     setLoading(true);
     setError(null);
     try {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-      if (!session) {
+      const token = await ensureValidAccessToken();
+      if (!token) {
         setError("Not authenticated");
         return;
       }
@@ -45,7 +43,7 @@ export function IntegrationsProvider({ children }: { children: ReactNode }) {
       const response = await fetch(
         `${supabaseUrl}/functions/v1/integrations`,
         {
-          headers: { Authorization: `Bearer ${session.access_token}` },
+          headers: { Authorization: `Bearer ${token}` },
         },
       );
 
@@ -77,6 +75,7 @@ export function IntegrationsProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     refresh();
+    return subscribeAuthChange(() => void refresh());
   }, [refresh]);
 
   return (
