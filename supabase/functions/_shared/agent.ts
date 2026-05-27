@@ -871,6 +871,37 @@ export async function runAgentLoop(
     );
   }
 
+  const planNeedsTools =
+    intentPlan.directApis.length > 0 || !intentPlan.skipCatalogSearch;
+
+  if (!sessionHandled && !planNeedsTools) {
+    appendAgentReasoning(
+      emitLive,
+      "Answering directly with the LLM (no tool discovery).\n",
+    );
+    emit({ type: "thinking", label: "Generating your answer…" });
+    const res = await llmChat(
+      model,
+      workingMessages,
+      undefined,
+      { toolChoice: "none" },
+    );
+    const choice = (res.data.choices as Array<Record<string, unknown>>)?.[0];
+    const message = choice?.message as Record<string, unknown> | undefined;
+    const finalAnswer = ((message?.content as string) ?? "I couldn't generate a response.").trim();
+    if (finalAnswer) {
+      streamTokens(finalAnswer, emitLive);
+    }
+    return {
+      assistantContent: finalAnswer,
+      toolSteps: [],
+      reasoningLog,
+      usageTokens: undefined,
+      contentStreamed: Boolean(finalAnswer),
+      toolContext: priorToolContext ?? undefined,
+    };
+  }
+
   let assistantContent = "";
   let usageTokens: number | undefined;
   const startedMs = Date.now();
@@ -888,25 +919,27 @@ export async function runAgentLoop(
     cache.allowedSlugs.add(tag.toLowerCase());
   }
 
-  appendAgentReasoning(emitLive, "Understanding what kind of data you need…\n");
+  if (planNeedsTools) {
+    appendAgentReasoning(emitLive, "Understanding what kind of data you need…\n");
 
-  if (followUpAffirmation && effectiveUserQuery !== userMessage.trim()) {
-    appendAgentReasoning(
-      emitLive,
-      `Continuing from your earlier question: ${effectiveUserQuery.slice(0, 140)}${effectiveUserQuery.length > 140 ? "…" : ""}\n`,
-    );
-  }
+    if (followUpAffirmation && effectiveUserQuery !== userMessage.trim()) {
+      appendAgentReasoning(
+        emitLive,
+        `Continuing from your earlier question: ${effectiveUserQuery.slice(0, 140)}${effectiveUserQuery.length > 140 ? "…" : ""}\n`,
+      );
+    }
 
-  if (!sessionHandled) {
-    await executeIntentPlan(
-      intentPlan,
-      workingMessages,
-      toolSteps,
-      emitLive,
-      cache,
-      priorToolContext,
-      followUpAffirmation,
-    );
+    if (!sessionHandled) {
+      await executeIntentPlan(
+        intentPlan,
+        workingMessages,
+        toolSteps,
+        emitLive,
+        cache,
+        priorToolContext,
+        followUpAffirmation,
+      );
+    }
   }
 
   const companyResearch = intentPlan.intent === "company_research";

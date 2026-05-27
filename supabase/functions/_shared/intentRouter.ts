@@ -135,6 +135,8 @@ CRITICAL: A company name in the question (OpenAI, Stripe, Shopify) does NOT mean
 Example: "latest news on OpenAI enterprise" → web_search with primaryApi "perplexity", NOT "openai".
 If Active API from prior turn is set (e.g. scrapecreators), continue with that slug for follow-ups like "popular creators".
 "popular creators" / TikTok / YouTube → primaryApi "scrapecreators", NOT "scrapegraphai".
+If the query is casual (e.g. "test message") or general conversation, set skipCatalogSearch and skipLlmToolRound to true so the agent answers directly without tooling.
+If the query clearly wants data, set skipCatalogSearch to false and provide a catalogSearchPrompt that guides tooling.
 
 JSON schema:
 {
@@ -142,6 +144,8 @@ JSON schema:
   "topicQuery": "cleaned user information need",
   "catalogSearchPrompt": "capability keywords for API catalog (never just a brand name)",
   "primaryApi": "perplexity|company-enrich|crustdata|parallel|scrapegraphai|null",
+  "skipCatalogSearch": true|false,
+  "skipLlmToolRound": true|false,
   "confidence": "high|medium|low"
 }`;
 
@@ -181,6 +185,19 @@ function planFromLlmJson(
   }
 
   const skipDirect = directApis.length > 0;
+  const explicitSkipCatalogSearch =
+    typeof parsed.skipCatalogSearch === "boolean"
+      ? parsed.skipCatalogSearch
+      : undefined;
+  const explicitSkipLlmToolRound =
+    typeof parsed.skipLlmToolRound === "boolean"
+      ? parsed.skipLlmToolRound
+      : undefined;
+  const skipCatalogSearch =
+    explicitSkipCatalogSearch ?? (skipDirect && intent === "web_search");
+  const skipLlmToolRound =
+    explicitSkipLlmToolRound ??
+    (skipDirect && (intent === "web_search" || intent === "web_scrape"));
   return {
     intent,
     topicQuery,
