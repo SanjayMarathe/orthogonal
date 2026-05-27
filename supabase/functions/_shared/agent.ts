@@ -759,6 +759,44 @@ export async function runAgentLoop(
   const routingTaggedApis =
     taggedApis.length > 0 ? taggedApis : inheritedTaggedApis;
 
+  const intentPlan = await classifyQueryIntent(
+    model,
+    messages,
+    effectiveUserQuery,
+    taggedApis,
+    inheritedTaggedApis,
+  );
+
+  const planNeedsTools =
+    intentPlan.directApis.length > 0 || !intentPlan.skipCatalogSearch;
+
+  if (!planNeedsTools) {
+    emit({ type: "thinking", label: "Generating your answer…" });
+    const res = await llmChat(
+      model,
+      [
+        { role: "system", content: SYSTEM_PROMPT },
+        ...messages,
+      ],
+      undefined,
+      { toolChoice: "none" },
+    );
+    const choice = (res.data.choices as Array<Record<string, unknown>>)?.[0];
+    const message = choice?.message as Record<string, unknown> | undefined;
+    const finalAnswer = ((message?.content as string) ?? "I couldn't generate a response.").trim();
+    if (finalAnswer) {
+      streamTokens(finalAnswer, emit);
+    }
+    return {
+      assistantContent: finalAnswer,
+      toolSteps: [],
+      reasoningLog: "",
+      usageTokens: undefined,
+      contentStreamed: Boolean(finalAnswer),
+      toolContext: priorToolContext ?? undefined,
+    };
+  }
+
   let reasoningLog = "";
 
   const emitLive: EmitFn = (event) => {
@@ -773,6 +811,11 @@ export async function runAgentLoop(
     }
     emit(event);
   };
+
+  appendAgentReasoning(
+    emitLive,
+    `Routing as ${intentPlanSummary(intentPlan)}.\n`,
+  );
 
   const intro =
     taggedApis.length > 0 && isCapabilityQuestion(userMessage)
@@ -829,7 +872,7 @@ export async function runAgentLoop(
 
   let sessionLastEndpoint = apiSession?.lastEndpoint;
   const sessionResult =
-    apiSession && !topicSwitch && routingTaggedApis.length > 0
+    planNeedsTools && apiSession && !topicSwitch && routingTaggedApis.length > 0
       ? await runSessionFollowUpPipeline(
           apiSession,
           effectiveUserQuery,
@@ -843,63 +886,27 @@ export async function runAgentLoop(
   sessionLastEndpoint = sessionResult.lastEndpoint ?? sessionLastEndpoint;
   const sessionHandled = sessionResult.ran;
 
-  const fallbackIntentPlan: IntentPlan = {
-    intent: "api_discovery",
-    topicQuery: effectiveUserQuery,
-    catalogSearchPrompt: "",
-    directApis: [],
-    skipCatalogSearch: true,
-    skipLlmToolRound: true,
-    confidence: "high",
-    source: "rules",
-  };
+  if (planNeedsTools) {
+    appendAgentReasoning(emitLive, "Understanding what kind of data you need…\n");
 
-  const intentPlan = sessionHandled
-    ? fallbackIntentPlan
-    : await classifyQueryIntent(
-        model,
-        messages,
-        effectiveUserQuery,
-        taggedApis,
-        inheritedTaggedApis,
+    if (followUpAffirmation && effectiveUserQuery !== userMessage.trim()) {
+      appendAgentReasoning(
+        emitLive,
+        `Continuing from your earlier question: ${effectiveUserQuery.slice(0, 140)}${effectiveUserQuery.length > 140 ? "…" : ""}\n`,
       );
-
-  if (!sessionHandled) {
-    appendAgentReasoning(
-      emitLive,
-      `Routing as ${intentPlanSummary(intentPlan)}.\n`,
-    );
-  }
-
-  const planNeedsTools =
-    intentPlan.directApis.length > 0 || !intentPlan.skipCatalogSearch;
-
-  if (!sessionHandled && !planNeedsTools) {
-    appendAgentReasoning(
-      emitLive,
-      "Answering directly with the LLM (no tool discovery).\n",
-    );
-    emit({ type: "thinking", label: "Generating your answer…" });
-    const res = await llmChat(
-      model,
-      workingMessages,
-      undefined,
-      { toolChoice: "none" },
-    );
-    const choice = (res.data.choices as Array<Record<string, unknown>>)?.[0];
-    const message = choice?.message as Record<string, unknown> | undefined;
-    const finalAnswer = ((message?.content as string) ?? "I couldn't generate a response.").trim();
-    if (finalAnswer) {
-      streamTokens(finalAnswer, emitLive);
     }
-    return {
-      assistantContent: finalAnswer,
-      toolSteps: [],
-      reasoningLog,
-      usageTokens: undefined,
-      contentStreamed: Boolean(finalAnswer),
-      toolContext: priorToolContext ?? undefined,
-    };
+
+    if (!sessionHandled) {
+      await executeIntentPlan(
+        intentPlan,
+        workingMessages,
+        toolSteps,
+        emitLive,
+        cache,
+        priorToolContext,
+        followUpAffirmation,
+      );
+    }
   }
 
   let assistantContent = "";
