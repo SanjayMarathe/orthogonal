@@ -24,8 +24,9 @@ function generateTitle(message: string): string {
 const SSE_HEADERS = {
   ...corsHeaders,
   "Content-Type": "text/event-stream",
-  "Cache-Control": "no-cache",
+  "Cache-Control": "no-cache, no-transform",
   Connection: "keep-alive",
+  "X-Accel-Buffering": "no",
 };
 
 Deno.serve(async (req) => {
@@ -361,8 +362,18 @@ Deno.serve(async (req) => {
       return new Response(
         new ReadableStream({
           async start(controller) {
+            // Open the stream immediately so the client can render tool steps
+            // and tokens incrementally (avoid proxy buffering the whole response).
+            controller.enqueue(encoder.encode(": connected\n\n"));
+
+            let flushChain = Promise.resolve();
             const emit = (event: SseEvent) => {
-              controller.enqueue(encoder.encode(sseLine(event)));
+              flushChain = flushChain.then(async () => {
+                controller.enqueue(encoder.encode(sseLine(event)));
+                if (event.type === "token") {
+                  await new Promise((r) => setTimeout(r, 0));
+                }
+              });
             };
 
             try {
@@ -396,10 +407,12 @@ Deno.serve(async (req) => {
               const fullContent = finalContent + contextWarning;
 
               if (!contentStreamed || !assistantContent.trim()) {
-                streamTokens(fullContent, emit);
+                await streamTokens(fullContent, emit);
               } else if (contextWarning) {
-                streamTokens(contextWarning, emit);
+                await streamTokens(contextWarning, emit);
               }
+
+              await flushChain;
 
               await supabase.from("messages").insert({
                 conversation_id: conversationId,

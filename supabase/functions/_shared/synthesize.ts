@@ -43,32 +43,6 @@ export function pruneMessagesForSummary(messages: ChatMessage[]): ChatMessage[] 
   return pruned;
 }
 
-function synthesisPlanText(messages: ChatMessage[]): string {
-  const tools = messages.filter((m) => m.role === "tool");
-  const apis = new Set<string>();
-  for (const t of tools) {
-    const raw = t.content ?? "";
-    if (
-      raw.includes("company-enrich") || raw.includes('"domain"') ||
-      raw.includes("observed_employee_count") || raw.includes("department_headcount")
-    ) {
-      apis.add("company-enrich");
-    }
-    if (raw.includes("decision_makers") || raw.includes("crustdata")) {
-      apis.add("crustdata");
-    }
-    if (raw.includes('"results"') && (raw.includes("snippet") || raw.includes("perplexity"))) {
-      apis.add("perplexity");
-    }
-  }
-  const parts: string[] = [];
-  if (apis.has("company-enrich")) parts.push("company profile and headcount");
-  if (apis.has("crustdata")) parts.push("executive contacts");
-  if (apis.has("perplexity")) parts.push("web search results");
-  if (parts.length === 0) parts.push("the API results");
-  return `Now I'll turn ${parts.join(" and ")} into a clear answer for you.\n\n`;
-}
-
 function parseToolPayload(raw: string): unknown {
   try {
     return JSON.parse(raw);
@@ -194,11 +168,6 @@ export async function synthesizeFromToolResults(
   ];
 
   emit?.({ type: "thinking", label: "Writing your answer…" });
-  emit?.({
-    type: "reasoning_delta",
-    placement: "agent",
-    content: synthesisPlanText(workingMessages),
-  });
 
   let streamed = false;
   const streamRes = await llmChatStream(

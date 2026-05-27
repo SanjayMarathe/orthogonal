@@ -34,6 +34,10 @@ export function AssistantMessage({
     (isThinking || !!thinkingLabel);
   const showPostToolReasoning =
     Boolean(agentReasoning?.trim()) && toolSteps.length > 0;
+  const toolsDone =
+    toolSteps.length > 0 && !toolSteps.some((s) => s.status === "running");
+  const awaitingAnswerStream =
+    Boolean(isStreaming) && toolsDone && !content.trim();
 
   return (
     <div className="mb-6 space-y-3">
@@ -65,6 +69,13 @@ export function AssistantMessage({
           content={agentReasoning ?? ""}
           className="text-sm leading-relaxed text-gray-600 dark:text-gray-300"
         />
+      )}
+
+      {awaitingAnswerStream && (
+        <div className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
+          <span className="inline-block h-4 w-0.5 animate-pulse bg-gray-400 dark:bg-gray-500" />
+          <span>Streaming answer…</span>
+        </div>
       )}
 
       {content && (

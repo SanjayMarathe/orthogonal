@@ -236,7 +236,13 @@ export function useChat(onConversationUpdate?: () => void) {
               );
             }
             if (event.type === "reasoning_delta" && event.content) {
-              if (event.placement === "after_tools") {
+              const toolsFinished =
+                liveToolSteps.length > 0 &&
+                !liveToolSteps.some((s) => s.status === "running");
+              if (
+                event.placement === "after_tools" ||
+                (event.placement === "agent" && toolsFinished)
+              ) {
                 afterToolsReasoning += event.content;
               } else if (event.stepId) {
                 const idx = liveToolSteps.findIndex((s) => s.id === event.stepId);

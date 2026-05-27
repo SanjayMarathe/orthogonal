@@ -192,7 +192,7 @@ async function answerDirectly(
     };
   }
   if (!streamRes.ok && !assistantContent) {
-    streamTokens(content, emit);
+    await streamTokens(content, emit);
   }
   return { assistantContent: content, contentStreamed: Boolean(assistantContent) };
 }
@@ -1080,7 +1080,7 @@ export async function runAgentLoop(
     if (streamed) {
       contentStreamed = true;
     } else {
-      streamTokens(finalAnswer, emitLive);
+      await streamTokens(finalAnswer, emitLive);
       contentStreamed = true;
     }
   }
@@ -1097,7 +1097,7 @@ export async function runAgentLoop(
       ) ??
       "Sorry, I couldn't generate a response. Please try again.";
     assistantContent = emergency;
-    streamTokens(emergency, emitLive);
+    await streamTokens(emergency, emitLive);
     contentStreamed = true;
   }
 
@@ -1163,9 +1163,14 @@ export async function compressMessages(
   return (message?.content as string) ?? "Summary unavailable.";
 }
 
-export function streamTokens(content: string, emit: EmitFn): void {
-  const chunkSize = 4;
+/** Stream final text in small chunks with yields so SSE clients see incremental tokens. */
+export async function streamTokens(
+  content: string,
+  emit: EmitFn,
+): Promise<void> {
+  const chunkSize = 16;
   for (let i = 0; i < content.length; i += chunkSize) {
     emit({ type: "token", content: content.slice(i, i + chunkSize) });
+    await new Promise((r) => setTimeout(r, 0));
   }
 }

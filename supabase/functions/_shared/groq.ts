@@ -350,6 +350,8 @@ export async function groqChatStream(
           if (piece) {
             content += piece;
             onToken?.(piece);
+            // Yield so edge SSE can flush each token to the client.
+            await new Promise((r) => setTimeout(r, 0));
           }
         } catch {
           /* skip malformed chunk */
