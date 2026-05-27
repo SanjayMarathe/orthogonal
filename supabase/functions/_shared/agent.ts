@@ -82,6 +82,36 @@ Slash commands: /clear, /compress.`;
 const EDGE_BUDGET_MS = 138_000;
 const MAX_TOOL_STEPS_BEFORE_SYNTH = 3;
 
+const TOOL_KEYWORDS = [
+  "api",
+  "search",
+  "scrape",
+  "enrich",
+  "company",
+  "contact",
+  "data",
+  "tool",
+  "endpoint",
+  "crawl",
+  "wiki",
+  "web",
+  "news",
+  "leader",
+  "headcount",
+  "funding",
+];
+
+function requiresTooling(query: string, taggedApis: string[]): boolean {
+  if (taggedApis.length > 0) return true;
+  const lower = query.toLowerCase();
+  if (lower.includes("@")) return true;
+  if (/\\b(what can you do|available apis|capabilities|tools?)\\b/.test(lower)) {
+    return true;
+  }
+
+  return TOOL_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
 export type ToolCache = {
   details: Map<string, string>;
   search: Map<string, string>;
@@ -758,6 +788,35 @@ export async function runAgentLoop(
   const inheritedTaggedApis = inheritContext ? inheritedRaw : [];
   const routingTaggedApis =
     taggedApis.length > 0 ? taggedApis : inheritedTaggedApis;
+
+  const needsTooling = requiresTooling(effectiveUserQuery, routingTaggedApis);
+  if (!needsTooling) {
+    emitLive({ type: "reasoning_delta", placement: "agent", content: "Answering directly with the LLM (no tool discovery).\\n" });
+    emit({ type: "thinking", label: "Generating your answer…" });
+    const res = await llmChat(
+      model,
+      [
+        { role: "system", content: SYSTEM_PROMPT },
+        ...messages,
+      ],
+      undefined,
+      { toolChoice: "none" },
+    );
+    const choice = (res.data.choices as Array<Record<string, unknown>>)?.[0];
+    const message = choice?.message as Record<string, unknown> | undefined;
+    const finalAnswer = ((message?.content as string) ?? "I couldn't generate a response.").trim();
+    if (finalAnswer) {
+      streamTokens(finalAnswer, emitLive);
+    }
+    return {
+      assistantContent: finalAnswer,
+      toolSteps: [],
+      reasoningLog: "",
+      usageTokens: undefined,
+      contentStreamed: Boolean(finalAnswer),
+      toolContext: priorToolContext ?? undefined,
+    };
+  }
 
   let reasoningLog = "";
 
