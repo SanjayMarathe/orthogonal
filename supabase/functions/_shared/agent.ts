@@ -85,6 +85,54 @@ const CHAT_SYSTEM_PROMPT = `You are a helpful assistant. Answer clearly and conc
 const EDGE_BUDGET_MS = 138_000;
 const MAX_TOOL_STEPS_BEFORE_SYNTH = 3;
 
+const SENSITIVE_RESULT_KEYS = new Set([
+  "apikey",
+  "apiKey",
+  "authorization",
+  "access_token",
+  "refresh_token",
+  "token",
+  "secret",
+  "password",
+]);
+
+function redactSecretsInJsonString(raw: string): string {
+  // Redact common secret fields even when they appear inside a nested JSON string.
+  return raw
+    .replace(
+      /("?(?:apiKey|apikey|authorization|access_token|refresh_token|token|secret|password)"?\s*:\s*")([^"]+)(")/gi,
+      '$1[REDACTED]$3',
+    )
+    .replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, "$1[REDACTED]");
+}
+
+function redactSecretsDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSecretsDeep);
+  if (!value || typeof value !== "object") return value;
+
+  const obj = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+
+  for (const [k, v] of Object.entries(obj)) {
+    if (SENSITIVE_RESULT_KEYS.has(k) || SENSITIVE_RESULT_KEYS.has(k.toLowerCase())) {
+      out[k] = "[REDACTED]";
+    } else {
+      out[k] = redactSecretsDeep(v);
+    }
+  }
+  return out;
+}
+
+function sanitizeToolResultJson(raw: string): string {
+  const preRedacted = redactSecretsInJsonString(raw);
+  try {
+    const parsed = JSON.parse(preRedacted) as unknown;
+    return JSON.stringify(redactSecretsDeep(parsed));
+  } catch {
+    return preRedacted;
+  }
+}
+
 export type ToolCache = {
   details: Map<string, string>;
   search: Map<string, string>;
@@ -221,7 +269,9 @@ async function ensureLiveDataFetched(
       api: "crustdata",
       path: "/screener/company",
       query: {
-        company_name: companyName ?? domain.split(".")[0],
+        // Use domain-first for better matching on unknown/ambiguous company names.
+        // crustdataRetryQuery can still retry with a derived company_name if decision_makers is empty.
+        company_domain: domain,
         fields: "decision_makers,company_name,headcount",
       },
     },
@@ -343,6 +393,7 @@ export async function executeTool(
       const cacheKey = `${prompt}:${limit}`;
       if (cache?.search.has(cacheKey)) {
         resultContent = cache.search.get(cacheKey)!;
+        resultContent = sanitizeToolResultJson(resultContent);
         resultPreview = truncatePreview(resultContent);
         if (cache.searchCalls === 0) cache.searchCalls = 1;
       } else {
@@ -351,6 +402,7 @@ export async function executeTool(
         resultContent = res.ok
           ? JSON.stringify(res.data)
           : JSON.stringify({ error: res.error, data: res.data });
+        resultContent = sanitizeToolResultJson(resultContent);
         resultPreview = truncatePreview(resultContent);
         if (res.ok) {
           cache?.search.set(cacheKey, resultContent);
@@ -372,6 +424,7 @@ export async function executeTool(
         const cacheKey = `${api}:${path}`;
         if (cache?.details.has(cacheKey)) {
           resultContent = cache.details.get(cacheKey)!;
+          resultContent = sanitizeToolResultJson(resultContent);
           resultPreview = truncatePreview(resultContent);
         } else {
           const res = await orthogonalGetDetails(api, path);
@@ -379,6 +432,7 @@ export async function executeTool(
           resultContent = res.ok
             ? JSON.stringify(res.data)
             : JSON.stringify({ error: res.error, data: res.data });
+          resultContent = sanitizeToolResultJson(resultContent);
           resultPreview = truncatePreview(resultContent);
           if (res.ok) cache?.details.set(cacheKey, resultContent);
         }
@@ -426,6 +480,7 @@ export async function executeTool(
         resultContent = res.ok
           ? JSON.stringify(res.data)
           : JSON.stringify({ error: res.error, data: res.data });
+        resultContent = sanitizeToolResultJson(resultContent);
         resultPreview = truncatePreview(resultContent);
       }
     } else {
@@ -443,6 +498,11 @@ export async function executeTool(
 
   const durationMs = Date.now() - start;
   meta = { ...meta, durationMs: meta.durationMs ?? durationMs };
+
+  // Tool previews are shown in the UI (expanded by default), so ensure
+  // secrets (apiKey/tokens) never reach the client.
+  resultContent = sanitizeToolResultJson(resultContent);
+  resultPreview = truncatePreview(resultContent);
 
   const doneLabel = toolDoneLabel(name, args);
   emit({
@@ -465,7 +525,10 @@ export async function executeTool(
     meta,
   };
 
-  return { content: truncateToolContentForModel(resultContent), step };
+  // IMPORTANT: Do not "truncate for model" by slicing JSON strings and appending
+  // text — it can invalidate JSON and prevent downstream parsing/compaction.
+  // The synthesis phase already compacts tool payloads safely.
+  return { content: resultContent, step };
 }
 
 /**
@@ -987,7 +1050,9 @@ export async function runAgentLoop(
   }
 
   await ensureLiveDataFetched(
-    intentPlan.topicQuery,
+    // Gating for "company research" should be based on the resolved user query,
+    // not the classifier's possibly-truncated topicQuery.
+    effectiveUserQuery,
     workingMessages,
     toolSteps,
     emitLive,
